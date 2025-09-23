@@ -77,11 +77,18 @@ async function initMongo() {
         console.warn('MONGODB_URI not set; falling back to local JSON file storage.');
         return;
     }
-    mongoClient = new MongoClient(MONGODB_URI);
-    await mongoClient.connect();
-    const db = mongoClient.db(MONGODB_DB);
-    conversationsCol = db.collection(MONGODB_COLLECTION);
-    await conversationsCol.createIndex({ id: 1 }, { unique: true });
+    try {
+        mongoClient = new MongoClient(MONGODB_URI);
+        await mongoClient.connect();
+        const db = mongoClient.db(MONGODB_DB);
+        conversationsCol = db.collection(MONGODB_COLLECTION);
+        await conversationsCol.createIndex({ id: 1 }, { unique: true });
+        console.log('MongoDB connected successfully');
+    } catch (error) {
+        console.error('MongoDB connection failed:', error);
+        mongoClient = null;
+        conversationsCol = null;
+    }
 }
 
 // Fallback JSON file store (used only if Mongo not configured)
@@ -93,35 +100,49 @@ function ensureJsonStore() {
 }
 
 async function upsertConversation(record) {
-    if (conversationsCol) {
-        await conversationsCol.updateOne({ id: record.id }, { $set: record }, { upsert: true });
-    } else {
-        ensureJsonStore();
-        const raw = fs.readFileSync(CONV_FILE, 'utf-8');
-        const list = JSON.parse(raw);
-        const idx = list.findIndex(x => x.id === record.id);
-        if (idx >= 0) list[idx] = record; else list.push(record);
-        fs.writeFileSync(CONV_FILE, JSON.stringify(list, null, 2), 'utf-8');
+    try {
+        if (conversationsCol) {
+            await conversationsCol.updateOne({ id: record.id }, { $set: record }, { upsert: true });
+        } else {
+            ensureJsonStore();
+            const raw = fs.readFileSync(CONV_FILE, 'utf-8');
+            const list = JSON.parse(raw);
+            const idx = list.findIndex(x => x.id === record.id);
+            if (idx >= 0) list[idx] = record; else list.push(record);
+            fs.writeFileSync(CONV_FILE, JSON.stringify(list, null, 2), 'utf-8');
+        }
+    } catch (error) {
+        console.error('Failed to upsert conversation:', error);
     }
 }
 
 async function getConversations() {
-    if (conversationsCol) {
-        const list = await conversationsCol.find({}).sort({ updatedAt: -1 }).toArray();
-        return list;
+    try {
+        if (conversationsCol) {
+            const list = await conversationsCol.find({}).sort({ updatedAt: -1 }).toArray();
+            return list;
+        }
+        ensureJsonStore();
+        const raw = fs.readFileSync(CONV_FILE, 'utf-8');
+        const list = JSON.parse(raw);
+        return list.sort((a, b) => new Date(b.updatedAt).getTime() - new Date(a.updatedAt).getTime());
+    } catch (error) {
+        console.error('Failed to get conversations:', error);
+        return [];
     }
-    ensureJsonStore();
-    const raw = fs.readFileSync(CONV_FILE, 'utf-8');
-    const list = JSON.parse(raw);
-    return list.sort((a, b) => new Date(b.updatedAt).getTime() - new Date(a.updatedAt).getTime());
 }
 
 async function getConversationById(id) {
-    if (conversationsCol) {
-        return await conversationsCol.findOne({ id });
+    try {
+        if (conversationsCol) {
+            return await conversationsCol.findOne({ id });
+        }
+        const list = await getConversations();
+        return list.find(x => x.id === id);
+    } catch (error) {
+        console.error('Failed to get conversation by ID:', error);
+        return null;
     }
-    const list = await getConversations();
-    return list.find(x => x.id === id);
 }
 
 // Gemini configuration
@@ -131,6 +152,7 @@ let gemini;
 if (GEMINI_API_KEY) {
     try {
         gemini = new GoogleGenerativeAI(GEMINI_API_KEY);
+        console.log('Gemini AI initialized successfully');
     } catch (e) {
         console.warn('Failed to init Gemini SDK:', e);
     }
@@ -179,7 +201,7 @@ async function classifyRiskAndCounselling(transcriptText) {
     else if (tendency === 'medium') needsCounselling = 'advised';
 
     // If Gemini is available, ask it to produce a calibrated review and labels
-    if (gemini) {
+    if (gemini && transcriptText && transcriptText.trim().length > 0) {
         try {
             const model = gemini.getGenerativeModel({ model: GEMINI_MODEL });
             const prompt = `You are assessing a phone conversation transcript for suicidal risk in Indian context. 
@@ -197,6 +219,7 @@ ${transcriptText || ''}
                 return { tendency: tendencyGem, needsCounselling: needs, review, score };
             } catch (_) {
                 // fall through to rule-based review when JSON not parseable
+                console.warn('Failed to parse Gemini JSON response');
             }
         } catch (e) {
             console.warn('Gemini classification failed; using rule-based fallback:', e);
@@ -217,42 +240,81 @@ ${transcriptText || ''}
 
 // Create Ultravox call and get join URL
 async function createUltravoxCall(config = ULTRAVOX_CALL_CONFIG) {
-    const request = https.request(ULTRAVOX_API_URL, {
-        method: 'POST',
-        headers: {
-            'Content-Type': 'application/json',
-            'X-API-Key': ULTRAVOX_API_KEY
-        }
-    });
-
     return new Promise((resolve, reject) => {
+        // Validate required config
+        if (!ULTRAVOX_API_KEY) {
+            reject(new Error('ULTRAVOX_API_KEY is required'));
+            return;
+        }
+
+        const postData = JSON.stringify(config);
+        console.log('Creating Ultravox call with config:', JSON.stringify(config, null, 2));
+
+        const request = https.request(ULTRAVOX_API_URL, {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json',
+                'X-API-Key': ULTRAVOX_API_KEY,
+                'Content-Length': Buffer.byteLength(postData)
+            },
+            timeout: 10000 // 10 second timeout
+        });
+
         let data = '';
 
         request.on('response', (response) => {
+            console.log(`Ultravox API response status: ${response.statusCode}`);
+            console.log('Response headers:', response.headers);
+            
             response.on('data', chunk => data += chunk);
             response.on('end', () => {
+                console.log('Ultravox API response body:', data);
                 try {
                     const parsed = JSON.parse(data || '{}');
-                    resolve(parsed);
+                    if (response.statusCode >= 400) {
+                        reject(new Error(`Ultravox API error ${response.statusCode}: ${data}`));
+                    } else {
+                        resolve(parsed);
+                    }
                 } catch (e) {
                     console.error('Failed parsing Ultravox response:', e, data);
-                    resolve({});
+                    reject(new Error(`Failed to parse Ultravox response: ${data}`));
                 }
             });
         });
 
-        request.on('error', reject);
-        request.write(JSON.stringify(config));
+        request.on('error', (error) => {
+            console.error('Ultravox API request error:', error);
+            reject(error);
+        });
+
+        request.on('timeout', () => {
+            console.error('Ultravox API request timeout');
+            request.destroy();
+            reject(new Error('Ultravox API request timeout'));
+        });
+
+        request.write(postData);
         request.end();
     });
 }
 
 // Handle incoming calls
 app.post('/incoming', async (req, res) => {
+    const startTime = Date.now();
+    console.log('=== INCOMING CALL ===');
+    console.log('Request body:', JSON.stringify(req.body, null, 2));
+    console.log('Request headers:', JSON.stringify(req.headers, null, 2));
+
     try {
         // Get caller's phone number
         const callerNumber = req.body.From;
-        console.log(`Incoming call from: ${callerNumber}`);
+        const callSid = req.body.CallSid;
+        console.log(`Incoming call from: ${callerNumber}, CallSid: ${callSid}`);
+
+        if (!callerNumber) {
+            throw new Error('No caller number found in request');
+        }
 
         // Create dynamic system prompt with caller's number
         const dynamicSystemPrompt = `Your name is Arjun and you're a good friend who's always there to listen and chat. You have a calm and supportive personality, but you're casual and down-to-earth rather than clinical.
@@ -299,15 +361,37 @@ Remember: Your primary goal is to be a good listener. People often just need som
         const callConfig = {
             ...ULTRAVOX_CALL_CONFIG,
             systemPrompt: dynamicSystemPrompt,
-            voice: ULTRAVOX_VOICE_ID // Indian male voice
+            voice: ULTRAVOX_VOICE_ID, // Indian male voice
+            medium: {
+                twilio: {
+                    // Add any Twilio-specific configuration if needed
+                }
+            }
         };
+        
+        console.log('Attempting to create Ultravox call...');
         
         // Create Ultravox call with updated config
         const uvxResponse = await createUltravoxCall(callConfig);
+        console.log('Ultravox call created successfully:', uvxResponse);
+        
         const joinUrl = uvxResponse?.joinUrl;
         const callId = uvxResponse?.id || uvxResponse?.callId;
 
+        if (!joinUrl) {
+            throw new Error(`No joinUrl received from Ultravox. Response: ${JSON.stringify(uvxResponse)}`);
+        }
+
+        console.log(`Generated joinUrl: ${joinUrl}`);
+        console.log(`Call ID: ${callId}`);
+
+        // Create TwiML response
         const twiml = new twilio.twiml.VoiceResponse();
+        
+        // Add a brief greeting before connecting (optional)
+        // twiml.say('Connecting you now...');
+        
+        // Connect to Ultravox stream
         const connect = twiml.connect();
         connect.stream({
             url: joinUrl,
@@ -315,12 +399,18 @@ Remember: Your primary goal is to be a good listener. People often just need som
         });
 
         const twimlString = twiml.toString();
+        console.log('Generated TwiML:', twimlString);
+        
+        // Set proper content type and send response
         res.type('text/xml');
         res.send(twimlString);
+
+        console.log(`Call setup completed in ${Date.now() - startTime}ms`);
 
         // Pre-create a conversation record with call metadata (non-blocking)
         const record = {
             id: callId || `call_${Date.now()}`,
+            twilioCallSid: callSid,
             from: callerNumber,
             createdAt: new Date().toISOString(),
             updatedAt: new Date().toISOString(),
@@ -328,14 +418,27 @@ Remember: Your primary goal is to be a good listener. People often just need som
             summary: '',
             tendency: 'no',
             needsCounselling: 'no',
-            raw: { uvxResponse }
+            raw: { uvxResponse, twilioRequest: req.body }
         };
-        upsertConversation(record).catch(err => console.warn('Failed to pre-create conversation record:', err));
+        
+        upsertConversation(record).catch(err => 
+            console.warn('Failed to pre-create conversation record:', err)
+        );
 
     } catch (error) {
         console.error('Error handling incoming call:', error);
+        console.error('Error stack:', error.stack);
+        
+        // Always send a valid TwiML response to prevent call drops
         const twiml = new twilio.twiml.VoiceResponse();
-        twiml.say('I apologize, but we\'re experiencing difficulty connecting your call. Please try again shortly or reach out to the crisis line if you need immediate support.');
+        twiml.say({
+            voice: 'alice',
+            language: 'en-IN'
+        }, 'I apologize, but we are experiencing difficulty connecting your call. Please try again shortly.');
+        
+        // Optionally redirect to a fallback number or hang up gracefully
+        twiml.hangup();
+        
         res.type('text/xml');
         res.send(twiml.toString());
     }
@@ -344,120 +447,162 @@ Remember: Your primary goal is to be a good listener. People often just need som
 // Generic endpoint to receive conversation transcripts (from Ultravox webhook or other source)
 // Expected body: { callId, from, transcript, summary }
 app.post('/conversations', async (req, res) => {
-    const { callId, from, transcript, summary } = req.body || {};
-    if (!callId && !from) {
-        return res.status(400).json({ ok: false, error: 'callId or from is required' });
-    }
+    try {
+        const { callId, from, transcript, summary } = req.body || {};
+        console.log('Received conversation data:', { callId, from, transcriptLength: transcript?.length });
+        
+        if (!callId && !from) {
+            return res.status(400).json({ ok: false, error: 'callId or from is required' });
+        }
 
-    const existing = await getConversationById(callId);
-    const { tendency, needsCounselling, review } = await classifyRiskAndCounselling(transcript || '');
-    const record = {
-        id: callId || (existing?.id || `call_${Date.now()}`),
-        from: from || existing?.from || 'unknown',
-        createdAt: existing?.createdAt || new Date().toISOString(),
-        updatedAt: new Date().toISOString(),
-        transcript: transcript || existing?.transcript || '',
-        summary: summary || review,
-        tendency,
-        needsCounselling,
-        raw: existing?.raw
-    };
-    await upsertConversation(record);
-    res.json({ ok: true, conversation: record });
+        const existing = await getConversationById(callId);
+        const { tendency, needsCounselling, review } = await classifyRiskAndCounselling(transcript || '');
+        const record = {
+            id: callId || (existing?.id || `call_${Date.now()}`),
+            from: from || existing?.from || 'unknown',
+            createdAt: existing?.createdAt || new Date().toISOString(),
+            updatedAt: new Date().toISOString(),
+            transcript: transcript || existing?.transcript || '',
+            summary: summary || review,
+            tendency,
+            needsCounselling,
+            raw: existing?.raw
+        };
+        await upsertConversation(record);
+        res.json({ ok: true, conversation: record });
+    } catch (error) {
+        console.error('Error in /conversations endpoint:', error);
+        res.status(500).json({ ok: false, error: 'Internal server error' });
+    }
 });
 
 // Ultravox event webhook (best-effort schema-agnostic)
 app.post('/ultravox/events', async (req, res) => {
-    const event = req.body || {};
-    // Attempt to extract call identity and transcript/summary
-    const callId = event.id || event.callId || event.call_id || event.data?.callId;
-    const from = event.from || event.caller || event.data?.from;
-    const transcript = event.transcript || event.data?.transcript || '';
-    const summary = event.summary || event.data?.summary || '';
+    try {
+        console.log('Received Ultravox event:', JSON.stringify(req.body, null, 2));
+        
+        const event = req.body || {};
+        // Attempt to extract call identity and transcript/summary
+        const callId = event.id || event.callId || event.call_id || event.data?.callId;
+        const from = event.from || event.caller || event.data?.from;
+        const transcript = event.transcript || event.data?.transcript || '';
+        const summary = event.summary || event.data?.summary || '';
+        const eventType = event.type || event.event_type || 'unknown';
 
-    if (!callId && !transcript) {
-        // Accept event but no actionable data
-        return res.json({ ok: true });
+        console.log(`Processing event type: ${eventType} for call: ${callId}`);
+
+        if (!callId && !transcript) {
+            console.log('No actionable data in event, acknowledging...');
+            return res.json({ ok: true });
+        }
+
+        const existing = callId ? await getConversationById(callId) : undefined;
+        const { tendency, needsCounselling, review } = await classifyRiskAndCounselling(transcript);
+        const record = {
+            id: callId || (existing?.id || `call_${Date.now()}`),
+            from: from || existing?.from || 'unknown',
+            createdAt: existing?.createdAt || new Date().toISOString(),
+            updatedAt: new Date().toISOString(),
+            transcript: transcript || existing?.transcript || '',
+            summary: summary || review,
+            tendency,
+            needsCounselling,
+            raw: { ...(existing?.raw || {}), event }
+        };
+        await upsertConversation(record);
+        res.json({ ok: true });
+    } catch (error) {
+        console.error('Error in Ultravox webhook:', error);
+        res.status(500).json({ ok: false, error: 'Internal server error' });
     }
-
-    const existing = callId ? await getConversationById(callId) : undefined;
-    const { tendency, needsCounselling, review } = await classifyRiskAndCounselling(transcript);
-    const record = {
-        id: callId || (existing?.id || `call_${Date.now()}`),
-        from: from || existing?.from || 'unknown',
-        createdAt: existing?.createdAt || new Date().toISOString(),
-        updatedAt: new Date().toISOString(),
-        transcript: transcript || existing?.transcript || '',
-        summary: summary || review,
-        tendency,
-        needsCounselling,
-        raw: { ...(existing?.raw || {}), event }
-    };
-    await upsertConversation(record);
-    res.json({ ok: true });
 });
 
 // API to fetch conversations
 app.get('/api/conversations', async (_req, res) => {
-    const convs = await getConversations();
-    res.json({ ok: true, conversations: convs });
+    try {
+        const convs = await getConversations();
+        res.json({ ok: true, conversations: convs });
+    } catch (error) {
+        console.error('Error fetching conversations:', error);
+        res.status(500).json({ ok: false, error: 'Internal server error' });
+    }
+});
+
+// Health check endpoint
+app.get('/health', (req, res) => {
+    res.json({ 
+        ok: true, 
+        timestamp: new Date().toISOString(),
+        env: {
+            hasUltravoxKey: !!ULTRAVOX_API_KEY,
+            hasMongoUri: !!MONGODB_URI,
+            hasGeminiKey: !!GEMINI_API_KEY,
+            baseUrl: BASE_URL
+        }
+    });
 });
 
 // Simple dashboard
 app.get('/dashboard', async (_req, res) => {
-    const convs = await getConversations();
+    try {
+        const convs = await getConversations();
 
-    const rows = convs.map(c => `
-        <tr>
-            <td style="font-family:sans-serif;padding:8px;">${c.id}</td>
-            <td style="font-family:sans-serif;padding:8px;">${c.from}</td>
-            <td style="font-family:sans-serif;padding:8px;">${new Date(c.createdAt).toLocaleString()}</td>
-            <td style="font-family:sans-serif;padding:8px;">${new Date(c.updatedAt).toLocaleString()}</td>
-            <td style="font-family:sans-serif;padding:8px;">${badge(c.tendency)}</td>
-            <td style="font-family:sans-serif;padding:8px;">${badge(c.needsCounselling)}</td>
-            <td style="font-family:sans-serif;padding:8px;"><a href="/conversations/${encodeURIComponent(c.id)}">View</a></td>
-        </tr>
-    `).join('');
+        const rows = convs.map(c => `
+            <tr>
+                <td style="font-family:sans-serif;padding:8px;">${c.id}</td>
+                <td style="font-family:sans-serif;padding:8px;">${c.from}</td>
+                <td style="font-family:sans-serif;padding:8px;">${new Date(c.createdAt).toLocaleString()}</td>
+                <td style="font-family:sans-serif;padding:8px;">${new Date(c.updatedAt).toLocaleString()}</td>
+                <td style="font-family:sans-serif;padding:8px;">${badge(c.tendency)}</td>
+                <td style="font-family:sans-serif;padding:8px;">${badge(c.needsCounselling)}</td>
+                <td style="font-family:sans-serif;padding:8px;"><a href="/conversations/${encodeURIComponent(c.id)}">View</a></td>
+            </tr>
+        `).join('');
 
-    const html = `<!doctype html>
-    <html>
-    <head>
-        <meta charset="utf-8" />
-        <meta name="viewport" content="width=device-width, initial-scale=1" />
-        <title>Conversations Dashboard</title>
-        <style>
-            .badge{display:inline-block;padding:2px 8px;border-radius:12px;color:#fff;font-size:12px}
-            .no{background:#64748b}
-            .low{background:#22c55e}
-            .medium{background:#f59e0b}
-            .high{background:#ef4444}
-            .severe{background:#7f1d1d}
-            .yes{background:#ef4444}
-            .advised{background:#f59e0b}
-        </style>
-    </head>
-    <body style="margin:24px;font-family:sans-serif;">
-        <h2>Conversations Dashboard</h2>
-        <table border="1" cellspacing="0" cellpadding="0" style="border-collapse:collapse;min-width:960px;">
-            <thead>
-                <tr>
-                    <th style="padding:8px;text-align:left;">ID</th>
-                    <th style="padding:8px;text-align:left;">From</th>
-                    <th style="padding:8px;text-align:left;">Created</th>
-                    <th style="padding:8px;text-align:left;">Updated</th>
-                    <th style="padding:8px;text-align:left;">Tendency</th>
-                    <th style="padding:8px;text-align:left;">Counselling</th>
-                    <th style="padding:8px;text-align:left;">Action</th>
-                </tr>
-            </thead>
-            <tbody>
-                ${rows}
-            </tbody>
-        </table>
-    </body>
-    </html>`;
+        const html = `<!doctype html>
+        <html>
+        <head>
+            <meta charset="utf-8" />
+            <meta name="viewport" content="width=device-width, initial-scale=1" />
+            <title>Conversations Dashboard</title>
+            <style>
+                .badge{display:inline-block;padding:2px 8px;border-radius:12px;color:#fff;font-size:12px}
+                .no{background:#64748b}
+                .low{background:#22c55e}
+                .medium{background:#f59e0b}
+                .high{background:#ef4444}
+                .severe{background:#7f1d1d}
+                .yes{background:#ef4444}
+                .advised{background:#f59e0b}
+            </style>
+        </head>
+        <body style="margin:24px;font-family:sans-serif;">
+            <h2>Conversations Dashboard</h2>
+            <p><a href="/health">Health Check</a> | Total Conversations: ${convs.length}</p>
+            <table border="1" cellspacing="0" cellpadding="0" style="border-collapse:collapse;min-width:960px;">
+                <thead>
+                    <tr>
+                        <th style="padding:8px;text-align:left;">ID</th>
+                        <th style="padding:8px;text-align:left;">From</th>
+                        <th style="padding:8px;text-align:left;">Created</th>
+                        <th style="padding:8px;text-align:left;">Updated</th>
+                        <th style="padding:8px;text-align:left;">Tendency</th>
+                        <th style="padding:8px;text-align:left;">Counselling</th>
+                        <th style="padding:8px;text-align:left;">Action</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    ${rows}
+                </tbody>
+            </table>
+        </body>
+        </html>`;
 
-    res.type('html').send(html);
+        res.type('html').send(html);
+    } catch (error) {
+        console.error('Error rendering dashboard:', error);
+        res.status(500).send('Error loading dashboard');
+    }
 });
 
 // Conversation detail page
@@ -495,14 +640,56 @@ app.get('/conversations/:id', (req, res) => {
         <p>${(c.summary || '').replace(/</g, '&lt;')}</p>
         <h3>Transcript</h3>
         <pre style="white-space:pre-wrap;">${(c.transcript || '').replace(/</g, '&lt;')}</pre>
+        <h3>Raw Data</h3>
+        <pre style="white-space:pre-wrap;font-size:12px;">${JSON.stringify(c.raw || {}, null, 2).replace(/</g, '&lt;')}</pre>
     </body>
     </html>`;
         res.type('html').send(html);
-    }).catch(() => res.status(500).send('Error'));
+    }).catch(err => {
+        console.error('Error loading conversation:', err);
+        res.status(500).send('Error loading conversation');
+    });
+});
+
+// Error handling middleware
+app.use((err, req, res, next) => {
+    console.error('Unhandled error:', err);
+    if (req.accepts('xml')) {
+        // If it's a Twilio webhook, send valid TwiML
+        const twiml = new twilio.twiml.VoiceResponse();
+        twiml.say('An error occurred. Please try again.');
+        twiml.hangup();
+        res.type('text/xml').send(twiml.toString());
+    } else {
+        res.status(500).json({ ok: false, error: 'Internal server error' });
+    }
 });
 
 // Start server
 app.listen(port, async () => {
-    await initMongo().catch(() => {});
-    console.log(`Server running on port ${port}`);
+    console.log(`=== SERVER STARTING ===`);
+    console.log(`Port: ${port}`);
+    console.log(`Base URL: ${BASE_URL}`);
+    console.log(`Ultravox API URL: ${ULTRAVOX_API_URL}`);
+    console.log(`Environment variables check:`);
+    console.log(`- ULTRAVOX_API_KEY: ${ULTRAVOX_API_KEY ? 'SET' : 'MISSING'}`);
+    console.log(`- MONGODB_URI: ${MONGODB_URI ? 'SET' : 'NOT SET (using JSON file)'}`);
+    console.log(`- GEMINI_API_KEY: ${GEMINI_API_KEY ? 'SET' : 'NOT SET'}`);
+    console.log(`- BASE_URL: ${BASE_URL}`);
+    
+    if (!ULTRAVOX_API_KEY) {
+        console.error('❌ CRITICAL: ULTRAVOX_API_KEY is missing! Calls will fail.');
+    }
+    
+    try {
+        await initMongo();
+        console.log('✅ Database initialization completed');
+    } catch (error) {
+        console.error('❌ Database initialization failed:', error);
+    }
+    
+    console.log(`✅ Server running successfully on port ${port}`);
+    console.log(`Dashboard available at: ${BASE_URL}/dashboard`);
+    console.log(`Health check at: ${BASE_URL}/health`);
+    console.log(`=== SERVER READY ===`);
 });
