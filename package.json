@@ -9,6 +9,8 @@
   "dependencies": {
     "dotenv": "^16.4.7",
     "express": "^4.21.2",
-    "twilio": "^5.4.0"
+    "twilio": "^5.4.0",
+    "mongodb": "^6.9.0",
+    "@google/generative-ai": "^0.21.0"
   }
 }

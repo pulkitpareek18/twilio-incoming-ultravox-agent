@@ -65,6 +65,8 @@ This project demonstrates how to build an intelligent voice assistant using Twil
   - Auth Token
   - Twilio phone number
 - Ultravox API key
+ - MongoDB connection string
+ - Google Gemini API key
 
 ### Installation
 
@@ -79,14 +81,27 @@ This project demonstrates how to build an intelligent voice assistant using Twil
    npm install
    ```
 
-3. Set up environment variables:
-   ```bash
-   cp .env.example .env
-   ```
-
-4. Add your credentials to `.env`:
-   ```
+3. Create a `.env` file with your configuration:
+   ```env
+   PORT=3000
+   BASE_URL=https://your-public-url
    ULTRAVOX_API_KEY=your_ultravox_api_key
+   ULTRAVOX_API_URL=https://api.ultravox.ai/api/calls
+   ULTRAVOX_MODEL=fixie-ai/ultravox
+   ULTRAVOX_VOICE_ID=9f6262e3-1b03-4a0b-9921-50b9cff66a43
+   ULTRAVOX_TEMPERATURE=0.7
+   FIRST_SPEAKER=FIRST_SPEAKER_AGENT
+   # If Ultravox supports event callbacks, point this to your public webhook
+   ULTRAVOX_EVENT_WEBHOOK=${BASE_URL}/ultravox/events
+
+    # MongoDB
+    MONGODB_URI=mongodb+srv://user:pass@cluster/dbname?retryWrites=true&w=majority
+    MONGODB_DB=ultravox
+    MONGODB_COLLECTION=conversations
+
+    # Gemini (Google Generative AI)
+    GEMINI_API_KEY=your_gemini_api_key
+    GEMINI_MODEL=gemini-1.5-flash
    ```
 
 ### Running the Application
@@ -97,6 +112,27 @@ node index.js
 ```
 
 Make sure to configure your Twilio webhook URL to point to your server's `/incoming` endpoint.
+
+### Webhooks and Transcripts
+
+- Ultravox events can POST to `/ultravox/events`. The handler is schema-agnostic and will try to persist `callId`, `from`, `transcript`, and `summary` if present.
+- You can also POST transcripts manually to `/conversations` with body:
+  ```json
+  { "callId": "abc123", "from": "+12345550123", "transcript": "...", "summary": "..." }
+  ```
+
+### Dashboard
+
+- Visit `/dashboard` to see all conversations, risk classification, and counselling recommendation.
+- Click into a row to view full transcript and AI-style review.
+
+Data is stored locally at `data/conversations.json`.
+If `MONGODB_URI` is set, data is stored in MongoDB (`${MONGODB_DB}.${MONGODB_COLLECTION}`) and the JSON file is ignored.
+
+### Notes on AI Classification
+
+- If `GEMINI_API_KEY` is provided, Gemini generates the dashboard review and labels.
+- If Gemini is unavailable or returns invalid JSON, a rule-based fallback is used.
 
 ## Known Limitations
 
