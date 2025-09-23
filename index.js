@@ -61,7 +61,7 @@ const ULTRAVOX_CALL_CONFIG = {
     firstSpeaker: FIRST_SPEAKER,
     medium: { twilio: {} },
     // If Ultravox supports event callbacks, allow setting via env
-    ...(ULTRAVOX_EVENT_WEBHOOK ? { eventWebhookUrl: ULTRAVOX_EVENT_WEBHOOK } : {})
+    // eventWebhookUrl is not a valid field for StartCallRequest and has been removed
 };
 
 // MongoDB configuration
