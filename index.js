@@ -136,6 +136,14 @@ if (GEMINI_API_KEY) {
     }
 }
 
+// Small helper to render colored badges in the dashboard
+function badge(label) {
+    const safe = String(label || '').toLowerCase();
+    const classes = ['no','low','medium','high','severe','yes','advised'];
+    const cls = classes.includes(safe) ? safe : 'no';
+    return `<span class="badge ${cls}">${safe || 'no'}</span>`;
+}
+
 // Classification logic
 async function classifyRiskAndCounselling(transcriptText) {
     const text = (transcriptText || '').toLowerCase();
