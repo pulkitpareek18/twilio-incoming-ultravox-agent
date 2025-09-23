@@ -310,9 +310,8 @@ Remember: Your primary goal is to be a good listener. People often just need som
         res.type('text/xml');
         res.send(twimlString);
 
-        // Pre-create a conversation record with call metadata
-        const conversations = readConversations();
-        conversations.push({
+        // Pre-create a conversation record with call metadata (non-blocking)
+        const record = {
             id: callId || `call_${Date.now()}`,
             from: callerNumber,
             createdAt: new Date().toISOString(),
@@ -322,8 +321,8 @@ Remember: Your primary goal is to be a good listener. People often just need som
             tendency: 'no',
             needsCounselling: 'no',
             raw: { uvxResponse }
-        });
-        writeConversations(conversations);
+        };
+        upsertConversation(record).catch(err => console.warn('Failed to pre-create conversation record:', err));
 
     } catch (error) {
         console.error('Error handling incoming call:', error);
