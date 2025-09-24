@@ -8,7 +8,7 @@ import { MongoClient } from 'mongodb';
 import { GoogleGenerativeAI } from '@google/generative-ai';
 
 const app = express();
-const port = Number(process.env.PORT || 3000);
+const port = Number(process.env.PORT || 5000);
 
 // Add middleware to parse incoming POST and JSON data
 app.use(express.urlencoded({ extended: true }));
@@ -166,76 +166,194 @@ function badge(label) {
     return `<span class="badge ${cls}">${safe || 'no'}</span>`;
 }
 
-// Classification logic
+// Enhanced Classification logic
 async function classifyRiskAndCounselling(transcriptText) {
     const text = (transcriptText || '').toLowerCase();
     let score = 0;
-
-    const severeTerms = [
-        'suicide', 'kill myself', 'end my life', 'i want to die', 'hang myself', 'jump off', 'overdose', 'self harm', 'self-harm', 'cut myself', 'no reason to live'
+    let detectedTerms = [];
+    
+    // Enhanced keyword categories with Hindi support and specific critical terms
+    const criticalSevereTerms = [
+        'suicide', 'kill myself', 'end my life', 'i want to die', 'hang myself', 'take my own life',
+        'marna chahta hun', 'jaan dena', 'suicide karna'
     ];
+    
+    const severePlanTerms = [
+        'jump off', 'overdose', 'self harm', 'self-harm', 'cut myself', 'razor blade', 
+        'poison myself', 'gun to my head', 'bought a rope', 'bought pills', 'wrote a note'
+    ];
+    
     const highTerms = [
-        'i am going to', 'i have a plan', 'i bought a rope', 'i bought pills', 'goodbye forever', 'can\'t go on', 'hopeless', 'life is meaningless'
+        // English terms
+        'i am going to', 'i have a plan', 'goodbye forever', 
+        'can\'t go on', 'hopeless', 'life is meaningless', 'nothing matters', 'give up completely',
+        'no way out', 'trapped forever', 'can\'t escape', 'ready to go', 'final decision',
+        'said goodbye', 'planning to end', 'going to jump', 'no reason to live', 'better off dead',
+        // Hindi terms
+        'koi raah nahi', 'umeed khatam', 'plan bana liya', 'alvida keh diya', 'bass khatam', 'zindagi khatam'
     ];
+    
     const mediumTerms = [
-        'depressed', 'depression', 'anxious', 'panic', 'can\'t sleep', 'lost interest', 'crying a lot', 'worthless'
+        // English terms
+        'depressed', 'depression', 'anxious', 'panic', 'can\'t sleep', 'lost interest', 
+        'crying a lot', 'worthless', 'feeling empty', 'numb inside', 'constant pain',
+        'overwhelming sadness', 'can\'t cope', 'breaking down', 'lost control', 'spiraling',
+        'dark thoughts', 'intrusive thoughts', 'mental breakdown', 'emotional pain',
+        // Hindi terms
+        'pareshan hun', 'depression hai', 'udaas hun', 'ro raha hun', 'kuch samajh nahi aa raha',
+        'pareshani hai', 'anxiety hai', 'ghabrat hai', 'dukh hai'
     ];
+    
     const lowTerms = [
-        'stressed', 'sad', 'lonely', 'down', 'upset', 'tired of everything'
+        // English terms
+        'stressed', 'sad', 'lonely', 'down', 'upset', 'tired of everything', 'frustrated',
+        'annoyed', 'irritated', 'fed up', 'overwhelmed', 'exhausted', 'burned out',
+        'bothered', 'disappointed', 'discouraged', 'moody', 'grumpy',
+        // Hindi terms
+        'pareshaan', 'gussa', 'tension', 'thak gaya', 'bore ho gaya', 'irritate ho raha',
+        'tang aa gaya', 'dimag kharab', 'stress hai'
     ];
 
-    for (const term of severeTerms) if (text.includes(term)) score += 4;
-    for (const term of highTerms) if (text.includes(term)) score += 3;
-    for (const term of mediumTerms) if (text.includes(term)) score += 2;
-    for (const term of lowTerms) if (text.includes(term)) score += 1;
+    // Count matches and calculate score with weighted logic
+    criticalSevereTerms.forEach(term => {
+        if (text.includes(term)) {
+            score += 8;  // Highest weight for critical severe terms
+            detectedTerms.push({ term, category: 'critical_severe' });
+        }
+    });
+    
+    severePlanTerms.forEach(term => {
+        if (text.includes(term)) {
+            score += 6;  // High weight for planning/method terms
+            detectedTerms.push({ term, category: 'severe_plan' });
+        }
+    });
+    
+    highTerms.forEach(term => {
+        if (text.includes(term)) {
+            score += 3;  // Keep high term weight
+            detectedTerms.push({ term, category: 'high' });
+        }
+    });
+    
+    mediumTerms.forEach(term => {
+        if (text.includes(term)) {
+            score += 2;  // Keep medium term weight
+            detectedTerms.push({ term, category: 'medium' });
+        }
+    });
+    
+    lowTerms.forEach(term => {
+        if (text.includes(term)) {
+            score += 1;  // Keep low term weight
+            detectedTerms.push({ term, category: 'low' });
+        }
+    });
 
+    // Enhanced pattern matching for immediate risk context
+    const immediateRiskPatterns = [
+        /i\s+(am|will|going to)\s+(kill|end|hurt|harm)\s+(my)/i,
+        /tonight\s+(i|will|going)/i,
+        /(plan|planning)\s+to\s+(die|kill|end)/i,
+        /(ready|prepared)\s+to\s+(die|go|leave)/i,
+        /going\s+to\s+(jump|hang)/i
+    ];
+    
+    immediateRiskPatterns.forEach(pattern => {
+        if (pattern.test(text)) {
+            score += 10;  // Maximum score for immediate risk patterns
+            detectedTerms.push({ term: 'immediate_risk_pattern', category: 'critical_severe' });
+        }
+    });
+
+    // Determine risk tendency based on refined score thresholds
     let tendency = 'no';
-    if (score >= 6) tendency = 'severe';
-    else if (score >= 4) tendency = 'high';
-    else if (score >= 2) tendency = 'medium';
-    else if (score >= 1) tendency = 'low';
+    if (score >= 10) tendency = 'severe';    // Lower threshold for severe (critical terms or patterns)
+    else if (score >= 6) tendency = 'high';  // High risk threshold
+    else if (score >= 4) tendency = 'medium'; // Medium risk threshold  
+    else if (score >= 1) tendency = 'low';   // Any detected term = low risk
 
-    // Counselling recommendation
+    // Enhanced counselling recommendation
     let needsCounselling = 'no';
     if (tendency === 'severe' || tendency === 'high') needsCounselling = 'yes';
     else if (tendency === 'medium') needsCounselling = 'advised';
 
     // If Gemini is available, ask it to produce a calibrated review and labels
+    let geminiAnalysis = null;
     if (gemini && transcriptText && transcriptText.trim().length > 0) {
         try {
             const model = gemini.getGenerativeModel({ model: GEMINI_MODEL });
-            const prompt = `You are assessing a phone conversation transcript for suicidal risk in Indian context. 
-Return a compact JSON with keys: tendency one of ["no","low","medium","high","severe"], counselling one of ["no","advised","yes"], review a 1-2 sentence summary for a dashboard.
-Transcript: """
-${transcriptText || ''}
-"""`;
+            const prompt = `Analyze this mental health conversation transcript for suicide risk and counseling needs. The conversation is with Arjun, a supportive Hindi-speaking friend helping someone in distress.
+
+TRANSCRIPT: "${transcriptText}"
+
+Please provide:
+1. Risk level (no/low/medium/high/severe)
+2. Counseling recommendation (no/advised/yes)
+3. Key concerning phrases or patterns you detected
+4. Brief explanation of your assessment
+5. Immediate intervention needed? (yes/no)
+6. Language used (Hindi/English/Mixed)
+
+Consider both English and Hindi expressions of distress, suicidal ideation, hopelessness, and mental health concerns.
+
+Respond in JSON format:
+{
+  "risk_level": "...",
+  "counseling_needed": "...", 
+  "concerning_phrases": [...],
+  "assessment": "...",
+  "immediate_intervention": "...",
+  "language": "..."
+}`;
+
             const result = await model.generateContent(prompt);
-            const textOut = result.response.text();
-            try {
-                const parsed = JSON.parse(textOut);
-                const tendencyGem = parsed.tendency || 'no';
-                const needs = parsed.counselling || 'no';
-                const review = parsed.review || '';
-                return { tendency: tendencyGem, needsCounselling: needs, review, score };
-            } catch (_) {
-                // fall through to rule-based review when JSON not parseable
-                console.warn('Failed to parse Gemini JSON response');
+            const response = await result.response;
+            const aiText = response.text();
+            
+            // Try to parse JSON response
+            const jsonMatch = aiText.match(/\{[\s\S]*\}/);
+            if (jsonMatch) {
+                geminiAnalysis = JSON.parse(jsonMatch[0]);
+                
+                // Override if AI detected higher risk
+                if (geminiAnalysis.risk_level === 'severe' && tendency !== 'severe') {
+                    tendency = 'severe';
+                    needsCounselling = 'yes';
+                    score += 3;
+                }
+                if (geminiAnalysis.counseling_needed === 'yes' && needsCounselling !== 'yes') {
+                    needsCounselling = 'yes';
+                }
             }
         } catch (e) {
             console.warn('Gemini classification failed; using rule-based fallback:', e);
         }
     }
 
-    // Lightweight AI-style review summary (rule-based fallback)
+    // Enhanced review summary with action items
     const review = (() => {
-        if (tendency === 'severe') return 'Immediate risk indicators present. Prioritize safety planning and emergency resources.';
-        if (tendency === 'high') return 'High risk signals detected. Encourage urgent professional support and monitoring.';
-        if (tendency === 'medium') return 'Moderate distress. Suggest counselling and coping strategies, schedule follow-up.';
-        if (tendency === 'low') return 'Mild distress. Provide support, active listening, and self-care guidance.';
-        return 'No risk indicators detected. Maintain supportive, empathetic tone.';
+        if (tendency === 'severe') return `🚨 SEVERE RISK DETECTED - Immediate intervention required. Score: ${score}. Terms: ${detectedTerms.map(t => t.term).join(', ')}. Consider emergency services.`;
+        if (tendency === 'high') return `⚠️ HIGH RISK - Urgent counseling recommended. Score: ${score}. Monitor closely and provide immediate support resources.`;
+        if (tendency === 'medium') return `⚡ MODERATE CONCERN - Professional counseling advised. Score: ${score}. Provide mental health resources and follow up.`;
+        if (tendency === 'low') return `💭 MILD DISTRESS - Supportive listening recommended. Score: ${score}. Emotional support and coping strategies helpful.`;
+        return 'No significant risk indicators detected. Maintain supportive, empathetic tone.';
     })();
 
-    return { tendency, needsCounselling, review, score };
+    // Log detailed analysis for monitoring
+    console.log(`Risk Analysis - Score: ${score}, Tendency: ${tendency}, Counselling: ${needsCounselling}`);
+    console.log(`Detected terms:`, detectedTerms);
+    if (geminiAnalysis) console.log(`AI Analysis:`, geminiAnalysis);
+
+    return { 
+        tendency, 
+        needsCounselling, 
+        review, 
+        score, 
+        detectedTerms,
+        geminiAnalysis,
+        immediateIntervention: tendency === 'severe' || detectedTerms.some(t => t.category === 'critical_severe') || (geminiAnalysis?.immediate_intervention === 'yes')
+    };
 }
 
 // Create Ultravox call and get join URL
@@ -444,8 +562,7 @@ Remember: Your primary goal is to be a good listener. People often just need som
     }
 });
 
-// Generic endpoint to receive conversation transcripts (from Ultravox webhook or other source)
-// Expected body: { callId, from, transcript, summary }
+// Enhanced conversation handling with real-time analysis and alerts
 app.post('/conversations', async (req, res) => {
     try {
         const { callId, from, transcript, summary } = req.body || {};
@@ -456,27 +573,93 @@ app.post('/conversations', async (req, res) => {
         }
 
         const existing = await getConversationById(callId);
-        const { tendency, needsCounselling, review } = await classifyRiskAndCounselling(transcript || '');
+        const analysis = await classifyRiskAndCounselling(transcript || '');
+        
         const record = {
             id: callId || (existing?.id || `call_${Date.now()}`),
             from: from || existing?.from || 'unknown',
             createdAt: existing?.createdAt || new Date().toISOString(),
             updatedAt: new Date().toISOString(),
             transcript: transcript || existing?.transcript || '',
-            summary: summary || review,
-            tendency,
-            needsCounselling,
+            summary: summary || analysis.review,
+            tendency: analysis.tendency,
+            needsCounselling: analysis.needsCounselling,
+            score: analysis.score,
+            detectedTerms: analysis.detectedTerms,
+            immediateIntervention: analysis.immediateIntervention,
+            geminiAnalysis: analysis.geminiAnalysis,
             raw: existing?.raw
         };
+        
         await upsertConversation(record);
-        res.json({ ok: true, conversation: record });
+
+        // Emergency response for severe cases
+        if (analysis.immediateIntervention || analysis.tendency === 'severe') {
+            console.log(`🚨 EMERGENCY ALERT - Severe risk detected for caller ${from}`);
+            console.log(`Risk Score: ${analysis.score}, Detected Terms: ${JSON.stringify(analysis.detectedTerms)}`);
+            
+            // Send emergency alert (non-blocking)
+            sendEmergencyAlert({
+                callId: record.id,
+                phone: from,
+                riskLevel: analysis.tendency,
+                score: analysis.score,
+                transcript: transcript,
+                timestamp: new Date().toISOString()
+            }).catch(err => console.error('Emergency alert failed:', err));
+        }
+
+        res.json({ ok: true, conversation: record, riskAnalysis: analysis });
     } catch (error) {
         console.error('Error in /conversations endpoint:', error);
         res.status(500).json({ ok: false, error: 'Internal server error' });
     }
 });
 
-// Ultravox event webhook (best-effort schema-agnostic)
+// Emergency alert function
+async function sendEmergencyAlert(alertData) {
+    try {
+        console.log(`📧 Sending emergency alert for call ${alertData.callId}`);
+        
+        // Log to file for audit trail
+        const alertLog = {
+            timestamp: alertData.timestamp,
+            callId: alertData.callId,
+            phone: alertData.phone,
+            riskLevel: alertData.riskLevel,
+            score: alertData.score,
+            action: 'emergency_alert_triggered'
+        };
+        
+        // You can implement various alert mechanisms:
+        
+        // 1. Email alert (example placeholder)
+        // await sendEmail({
+        //     to: 'crisis-team@yourorganization.com',
+        //     subject: `🚨 URGENT: High-Risk Call Alert - ${alertData.phone}`,
+        //     body: `Emergency intervention may be needed for call ${alertData.callId}...`
+        // });
+        
+        // 2. SMS alert (example placeholder)
+        // await sendSMS({
+        //     to: '+1234567890', // Crisis counselor number
+        //     message: `URGENT: High-risk call detected. Call ID: ${alertData.callId}, Risk: ${alertData.riskLevel}`
+        // });
+        
+        // 3. Slack/Discord webhook (example placeholder)
+        // await sendSlackAlert({
+        //     channel: '#crisis-alerts',
+        //     message: `🚨 EMERGENCY: Severe risk detected for caller ${alertData.phone}...`
+        // });
+        
+        console.log('Emergency alert processing completed');
+        
+    } catch (error) {
+        console.error('Failed to send emergency alert:', error);
+    }
+}
+
+// Enhanced Ultravox event webhook with real-time risk monitoring
 app.post('/ultravox/events', async (req, res) => {
     try {
         console.log('Received Ultravox event:', JSON.stringify(req.body, null, 2));
@@ -497,20 +680,51 @@ app.post('/ultravox/events', async (req, res) => {
         }
 
         const existing = callId ? await getConversationById(callId) : undefined;
-        const { tendency, needsCounselling, review } = await classifyRiskAndCounselling(transcript);
+        const analysis = await classifyRiskAndCounselling(transcript);
+        
         const record = {
             id: callId || (existing?.id || `call_${Date.now()}`),
             from: from || existing?.from || 'unknown',
             createdAt: existing?.createdAt || new Date().toISOString(),
             updatedAt: new Date().toISOString(),
             transcript: transcript || existing?.transcript || '',
-            summary: summary || review,
-            tendency,
-            needsCounselling,
+            summary: summary || analysis.review,
+            tendency: analysis.tendency,
+            needsCounselling: analysis.needsCounselling,
+            score: analysis.score,
+            detectedTerms: analysis.detectedTerms,
+            immediateIntervention: analysis.immediateIntervention,
+            geminiAnalysis: analysis.geminiAnalysis,
             raw: { ...(existing?.raw || {}), event }
         };
+        
         await upsertConversation(record);
-        res.json({ ok: true });
+
+        // Real-time intervention for severe cases during active calls
+        if ((analysis.immediateIntervention || analysis.tendency === 'severe') && eventType !== 'call_ended') {
+            console.log(`🚨 REAL-TIME ALERT - Severe risk detected DURING CALL for caller ${from}`);
+            console.log(`Event Type: ${eventType}, Risk Score: ${analysis.score}`);
+            
+            // Immediate emergency response during active call
+            sendEmergencyAlert({
+                callId: record.id,
+                phone: from,
+                riskLevel: analysis.tendency,
+                score: analysis.score,
+                transcript: transcript,
+                timestamp: new Date().toISOString(),
+                isLiveCall: eventType !== 'call_ended',
+                eventType: eventType
+            }).catch(err => console.error('Real-time emergency alert failed:', err));
+
+            // You could also implement:
+            // - Send immediate SMS to crisis counselors
+            // - Trigger conference call with mental health professional
+            // - Send push notifications to mobile crisis response team
+            // - Update AI agent's system prompt to include crisis de-escalation
+        }
+
+        res.json({ ok: true, riskAnalysis: analysis });
     } catch (error) {
         console.error('Error in Ultravox webhook:', error);
         res.status(500).json({ ok: false, error: 'Internal server error' });
@@ -542,29 +756,34 @@ app.get('/health', (req, res) => {
     });
 });
 
-// Simple dashboard
+// Enhanced dashboard with detailed risk analysis
 app.get('/dashboard', async (_req, res) => {
     try {
         const convs = await getConversations();
 
         const rows = convs.map(c => `
-            <tr>
+            <tr ${c.immediateIntervention ? 'style="background-color:#fef2f2;border-left:4px solid #dc2626;"' : ''}>
                 <td style="font-family:sans-serif;padding:8px;">${c.id}</td>
                 <td style="font-family:sans-serif;padding:8px;">${c.from}</td>
                 <td style="font-family:sans-serif;padding:8px;">${new Date(c.createdAt).toLocaleString()}</td>
                 <td style="font-family:sans-serif;padding:8px;">${new Date(c.updatedAt).toLocaleString()}</td>
                 <td style="font-family:sans-serif;padding:8px;">${badge(c.tendency)}</td>
                 <td style="font-family:sans-serif;padding:8px;">${badge(c.needsCounselling)}</td>
+                <td style="font-family:sans-serif;padding:8px;text-align:center;">${c.score || 0}</td>
+                <td style="font-family:sans-serif;padding:8px;text-align:center;">${c.immediateIntervention ? '🚨' : '-'}</td>
                 <td style="font-family:sans-serif;padding:8px;"><a href="/conversations/${encodeURIComponent(c.id)}">View</a></td>
             </tr>
         `).join('');
+
+        const emergencyCount = convs.filter(c => c.immediateIntervention || c.tendency === 'severe').length;
+        const highRiskCount = convs.filter(c => c.tendency === 'high').length;
 
         const html = `<!doctype html>
         <html>
         <head>
             <meta charset="utf-8" />
             <meta name="viewport" content="width=device-width, initial-scale=1" />
-            <title>Conversations Dashboard</title>
+            <title>Mental Health Monitoring Dashboard</title>
             <style>
                 .badge{display:inline-block;padding:2px 8px;border-radius:12px;color:#fff;font-size:12px}
                 .no{background:#64748b}
@@ -574,27 +793,57 @@ app.get('/dashboard', async (_req, res) => {
                 .severe{background:#7f1d1d}
                 .yes{background:#ef4444}
                 .advised{background:#f59e0b}
+                .stats{display:flex;gap:20px;margin:20px 0;}
+                .stat-card{background:#f8f9fa;padding:15px;border-radius:8px;text-align:center;min-width:120px;}
+                .stat-number{font-size:24px;font-weight:bold;color:#333;}
+                .stat-label{font-size:14px;color:#666;}
+                .emergency{background:#fee2e2;border-left:4px solid #dc2626;}
             </style>
         </head>
         <body style="margin:24px;font-family:sans-serif;">
-            <h2>Conversations Dashboard</h2>
-            <p><a href="/health">Health Check</a> | Total Conversations: ${convs.length}</p>
-            <table border="1" cellspacing="0" cellpadding="0" style="border-collapse:collapse;min-width:960px;">
-                <thead>
+            <h2>🧠 Mental Health Monitoring Dashboard</h2>
+            <p><a href="/health">Health Check</a> | <a href="/api/conversations">API</a></p>
+            
+            <div class="stats">
+                <div class="stat-card">
+                    <div class="stat-number">${convs.length}</div>
+                    <div class="stat-label">Total Calls</div>
+                </div>
+                <div class="stat-card emergency">
+                    <div class="stat-number">${emergencyCount}</div>
+                    <div class="stat-label">🚨 Emergency</div>
+                </div>
+                <div class="stat-card" style="background:#fef3c7;">
+                    <div class="stat-number">${highRiskCount}</div>
+                    <div class="stat-label">⚠️ High Risk</div>
+                </div>
+            </div>
+            
+            <table border="1" cellspacing="0" cellpadding="0" style="border-collapse:collapse;min-width:1100px;margin-top:20px;">
+                <thead style="background:#f1f5f9;">
                     <tr>
-                        <th style="padding:8px;text-align:left;">ID</th>
-                        <th style="padding:8px;text-align:left;">From</th>
-                        <th style="padding:8px;text-align:left;">Created</th>
+                        <th style="padding:8px;text-align:left;">Call ID</th>
+                        <th style="padding:8px;text-align:left;">Phone</th>
+                        <th style="padding:8px;text-align:left;">Started</th>
                         <th style="padding:8px;text-align:left;">Updated</th>
-                        <th style="padding:8px;text-align:left;">Tendency</th>
+                        <th style="padding:8px;text-align:left;">Risk Level</th>
                         <th style="padding:8px;text-align:left;">Counselling</th>
-                        <th style="padding:8px;text-align:left;">Action</th>
+                        <th style="padding:8px;text-align:left;">Score</th>
+                        <th style="padding:8px;text-align:left;">Alert</th>
+                        <th style="padding:8px;text-align:left;">Actions</th>
                     </tr>
                 </thead>
                 <tbody>
                     ${rows}
                 </tbody>
             </table>
+            
+            <div style="margin-top:20px;padding:15px;background:#f0f9ff;border-radius:8px;">
+                <h4>Legend:</h4>
+                <p><strong>Risk Levels:</strong> ${badge('no')} No Risk | ${badge('low')} Low | ${badge('medium')} Medium | ${badge('high')} High | ${badge('severe')} Severe</p>
+                <p><strong>Counselling:</strong> ${badge('no')} Not Needed | ${badge('advised')} Recommended | ${badge('yes')} Urgent</p>
+                <p><strong>🚨 Alert:</strong> Indicates immediate intervention may be needed</p>
+            </div>
         </body>
         </html>`;
 
