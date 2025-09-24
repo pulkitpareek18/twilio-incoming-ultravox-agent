@@ -480,16 +480,34 @@ async function createUltravoxCall(config = ULTRAVOX_CALL_CONFIG) {
         request.on('response', (response) => {
             console.log(`Ultravox API response status: ${response.statusCode}`);
             console.log('Response headers:', response.headers);
-            
+
             response.on('data', chunk => data += chunk);
             response.on('end', () => {
                 console.log('Ultravox API response body:', data);
                 try {
                     const parsed = JSON.parse(data || '{}');
+
+                    // Log detailed response for debugging
+                    console.log('Parsed Ultravox response:', JSON.stringify(parsed, null, 2));
+
                     if (response.statusCode >= 400) {
+                        console.error(`Ultravox API error ${response.statusCode}:`, parsed);
                         reject(new Error(`Ultravox API error ${response.statusCode}: ${data}`));
                     } else {
-                        resolve(parsed);
+                        // Validate that we got the expected fields
+                        const callId = parsed?.id || parsed?.callId;
+                        const joinUrl = parsed?.joinUrl;
+
+                        if (!callId) {
+                            console.error('Ultravox response missing call ID:', parsed);
+                            reject(new Error(`Ultravox response missing call ID. Response: ${JSON.stringify(parsed)}`));
+                        } else if (!joinUrl) {
+                            console.error('Ultravox response missing join URL:', parsed);
+                            reject(new Error(`Ultravox response missing join URL. Response: ${JSON.stringify(parsed)}`));
+                        } else {
+                            console.log(`✅ Ultravox call created successfully - ID: ${callId}, Join URL: ${joinUrl}`);
+                            resolve(parsed);
+                        }
                     }
                 } catch (e) {
                     console.error('Failed parsing Ultravox response:', e, data);
@@ -514,6 +532,63 @@ async function createUltravoxCall(config = ULTRAVOX_CALL_CONFIG) {
     });
 }
 
+// Retrieve call recording using the correct endpoint
+async function getCallRecording(callId) {
+    return new Promise((resolve, reject) => {
+        if (!ULTRAVOX_API_KEY) {
+            reject(new Error('ULTRAVOX_API_KEY is required'));
+            return;
+        }
+
+        const apiUrl = `https://api.ultravox.ai/api/calls/${callId}/recording`;
+        console.log(`Fetching call recording from: ${apiUrl}`);
+
+        const request = https.request(apiUrl, {
+            method: 'GET',
+            headers: {
+                'X-API-Key': ULTRAVOX_API_KEY
+            },
+            timeout: 30000 // Longer timeout for recording files
+        });
+
+        request.on('response', (response) => {
+            console.log(`Recording response status: ${response.statusCode}`);
+            
+            if (response.statusCode === 200) {
+                const chunks = [];
+                response.on('data', chunk => chunks.push(chunk));
+                response.on('end', () => {
+                    const audioBlob = Buffer.concat(chunks);
+                    console.log(`Recording received: ${audioBlob.length} bytes`);
+                    resolve(audioBlob);
+                });
+            } else if (response.statusCode === 404) {
+                console.log('Recording not available');
+                resolve(null);
+            } else {
+                let errorData = '';
+                response.on('data', chunk => errorData += chunk);
+                response.on('end', () => {
+                    reject(new Error(`Recording API error ${response.statusCode}: ${errorData}`));
+                });
+            }
+        });
+
+        request.on('error', (error) => {
+            console.error('Recording request error:', error);
+            reject(error);
+        });
+
+        request.on('timeout', () => {
+            console.error('Recording request timeout');
+            request.destroy();
+            reject(new Error('Recording request timeout'));
+        });
+
+        request.end();
+    });
+}
+
 // Retrieve call details and transcript from Ultravox API
 async function getUltravoxCallDetails(callId) {
     return new Promise((resolve, reject) => {
@@ -531,17 +606,17 @@ async function getUltravoxCallDetails(callId) {
                 'Content-Type': 'application/json',
                 'X-API-Key': ULTRAVOX_API_KEY
             },
-            timeout: 10000
+            timeout: 15000 // Increased timeout
         });
 
         let data = '';
 
         request.on('response', (response) => {
             console.log(`Ultravox call details response status: ${response.statusCode}`);
-            
+
             response.on('data', chunk => data += chunk);
             response.on('end', () => {
-                console.log(`Ultravox call details response: ${data}`);
+                console.log(`Ultravox call details response: ${data.substring(0, 500)}...`);
                 try {
                     const parsed = JSON.parse(data || '{}');
                     if (response.statusCode >= 400) {
@@ -550,7 +625,7 @@ async function getUltravoxCallDetails(callId) {
                         resolve(parsed);
                     }
                 } catch (e) {
-                    console.error('Failed parsing Ultravox call details response:', e, data);
+                    console.error('Failed parsing Ultravox response:', e, data);
                     reject(new Error(`Failed to parse Ultravox response: ${data}`));
                 }
             });
@@ -565,6 +640,74 @@ async function getUltravoxCallDetails(callId) {
             console.error('Ultravox call details request timeout');
             request.destroy();
             reject(new Error('Ultravox call details request timeout'));
+        });
+
+        request.end();
+    });
+}
+
+// Retrieve messages and extract transcript from the correct messages endpoint
+async function getUltravoxMessages(callId) {
+    return new Promise((resolve, reject) => {
+        if (!ULTRAVOX_API_KEY) {
+            reject(new Error('ULTRAVOX_API_KEY is required'));
+            return;
+        }
+
+        const apiUrl = `https://api.ultravox.ai/api/calls/${callId}/messages`;
+        console.log(`Fetching messages from: ${apiUrl}`);
+
+        const request = https.request(apiUrl, {
+            method: 'GET',
+            headers: {
+                'Content-Type': 'application/json',
+                'X-API-Key': ULTRAVOX_API_KEY
+            },
+            timeout: 15000
+        });
+
+        let data = '';
+
+        request.on('response', (response) => {
+            console.log(`Messages response status: ${response.statusCode}`);
+
+            response.on('data', chunk => data += chunk);
+            response.on('end', () => {
+                try {
+                    if (response.statusCode >= 400) {
+                        reject(new Error(`API error ${response.statusCode}: ${data}`));
+                        return;
+                    }
+
+                    const parsed = JSON.parse(data || '{}');
+                    console.log(`Messages received:`, parsed);
+                    
+                    // Extract transcript from messages
+                    let transcript = '';
+                    if (parsed.results && Array.isArray(parsed.results)) {
+                        transcript = parsed.results
+                            .filter(msg => msg.text && msg.text.trim())
+                            .map(msg => `${msg.role === 'MESSAGE_ROLE_USER' ? 'User' : 'Agent'}: ${msg.text}`)
+                            .join('\n');
+                    }
+                    
+                    resolve({ messages: parsed, transcript });
+                } catch (e) {
+                    console.error('Failed parsing messages response:', e, data);
+                    reject(new Error(`Failed to parse messages response: ${data}`));
+                }
+            });
+        });
+
+        request.on('error', (error) => {
+            console.error('Messages request error:', error);
+            reject(error);
+        });
+
+        request.on('timeout', () => {
+            console.error('Messages request timeout');
+            request.destroy();
+            reject(new Error('Messages request timeout'));
         });
 
         request.end();
@@ -644,6 +787,90 @@ async function getUltravoxTranscript(callId) {
 
             request.on('timeout', () => {
                 console.error(`Transcript request timeout for ${apiUrl}`);
+                request.destroy();
+                tryNextEndpoint();
+            });
+
+            request.end();
+        }
+
+        tryNextEndpoint();
+    });
+}
+
+// List calls from Ultravox API
+async function listUltravoxCalls(limit = 50) {
+    return new Promise((resolve, reject) => {
+        if (!ULTRAVOX_API_KEY) {
+            reject(new Error('ULTRAVOX_API_KEY is required'));
+            return;
+        }
+
+        // Try different possible list endpoints
+        const possibleEndpoints = [
+            `${ULTRAVOX_API_URL}?limit=${limit}`,
+            `https://api.ultravox.ai/api/calls?limit=${limit}`,
+            `${ULTRAVOX_API_URL}/list?limit=${limit}`,
+            `https://api.ultravox.ai/api/calls/list?limit=${limit}`
+        ];
+
+        let attemptCount = 0;
+
+        function tryNextEndpoint() {
+            if (attemptCount >= possibleEndpoints.length) {
+                reject(new Error('No calls list endpoint found'));
+                return;
+            }
+
+            const apiUrl = possibleEndpoints[attemptCount];
+            console.log(`Attempting to list calls from: ${apiUrl}`);
+            attemptCount++;
+
+            const request = https.request(apiUrl, {
+                method: 'GET',
+                headers: {
+                    'Content-Type': 'application/json',
+                    'X-API-Key': ULTRAVOX_API_KEY
+                },
+                timeout: 15000
+            });
+
+            let data = '';
+
+            request.on('response', (response) => {
+                console.log(`Calls list endpoint ${apiUrl} response status: ${response.statusCode}`);
+
+                response.on('data', chunk => data += chunk);
+                response.on('end', () => {
+                    try {
+                        if (response.statusCode === 404 || response.statusCode === 400) {
+                            // Try next endpoint
+                            tryNextEndpoint();
+                            return;
+                        }
+
+                        if (response.statusCode >= 400) {
+                            tryNextEndpoint();
+                            return;
+                        }
+
+                        const parsed = JSON.parse(data || '{}');
+                        console.log(`Calls list received: ${Array.isArray(parsed) ? parsed.length : 'non-array'} items`);
+                        resolve(parsed);
+                    } catch (e) {
+                        console.error('Failed parsing calls list response:', e, data);
+                        tryNextEndpoint();
+                    }
+                });
+            });
+
+            request.on('error', (error) => {
+                console.error(`Calls list request error for ${apiUrl}:`, error);
+                tryNextEndpoint();
+            });
+
+            request.on('timeout', () => {
+                console.error(`Calls list request timeout for ${apiUrl}`);
                 request.destroy();
                 tryNextEndpoint();
             });
@@ -738,6 +965,10 @@ Remember: Your primary goal is to be a good listener. People often just need som
             throw new Error(`No joinUrl received from Ultravox. Response: ${JSON.stringify(uvxResponse)}`);
         }
 
+        if (!callId) {
+            throw new Error(`No callId received from Ultravox. Response: ${JSON.stringify(uvxResponse)}`);
+        }
+
         console.log(`Generated joinUrl: ${joinUrl}`);
         console.log(`Call ID: ${callId}`);
 
@@ -765,7 +996,7 @@ Remember: Your primary goal is to be a good listener. People often just need som
 
         // Pre-create a conversation record with call metadata (non-blocking)
         const record = {
-            id: callId || `call_${Date.now()}`,
+            id: callId,
             twilioCallSid: callSid,
             from: callerNumber,
             createdAt: new Date().toISOString(),
@@ -901,13 +1132,13 @@ async function sendEmergencyAlert(alertData) {
 app.post('/ultravox/events', async (req, res) => {
     try {
         console.log('Received Ultravox event:', JSON.stringify(req.body, null, 2));
-        
+
         const event = req.body || {};
         // Extract call data based on Ultravox webhook structure
         const callId = event.id || event.callId || event.call_id || event.data?.callId || event.data?.id;
         const from = event.from || event.caller || event.data?.from || event.data?.caller;
         const eventType = event.type || event.event_type || event.event || 'unknown';
-        
+
         // Handle different Ultravox event types
         console.log(`🔔 Ultravox Event: ${eventType} for call: ${callId}`);
 
@@ -946,69 +1177,103 @@ app.post('/ultravox/events', async (req, res) => {
             return res.json({ ok: true, message: 'Call join recorded' });
         }
 
+        if (eventType === 'transcript_available' || eventType === 'transcript_ready' || eventType === 'transcription_complete') {
+            // Handle transcript becoming available after call
+            console.log('📝 Transcript became available for call:', callId);
+            if (callId) {
+                const existing = await getConversationById(callId);
+                if (existing && (!existing.transcript || existing.transcript.trim().length === 0)) {
+                    // Extract transcript from this event
+                    let transcript = event.transcript ||
+                                   event.data?.transcript ||
+                                   event.transcriptText ||
+                                   event.messages?.map(m => m.text || m.content).filter(Boolean).join(' ') ||
+                                   '';
+
+                    // Extract recording URL from event
+                    const recordingUrl = event.recordingUrl ||
+                                       event.recording_url ||
+                                       event.data?.recordingUrl ||
+                                       event.data?.recording_url ||
+                                       event.audioUrl ||
+                                       event.media?.audioUrl ||
+                                       '';
+
+                    if (transcript && transcript.trim().length > 0) {
+                        console.log(`📋 Transcript received via ${eventType} event: ${transcript.length} characters`);
+                        const analysis = await classifyRiskAndCounselling(transcript);
+
+                        const updatedRecord = {
+                            ...existing,
+                            updatedAt: new Date().toISOString(),
+                            transcript: transcript,
+                            summary: analysis.review,
+                            tendency: analysis.tendency,
+                            needsCounselling: analysis.needsCounselling,
+                            score: analysis.score,
+                            detectedTerms: analysis.detectedTerms,
+                            immediateIntervention: analysis.immediateIntervention,
+                            geminiAnalysis: analysis.geminiAnalysis,
+                            recordingUrl: recordingUrl || existing.recordingUrl || '',
+                            status: 'completed',
+                            raw: { ...(existing.raw || {}), transcriptEvent: event }
+                        };
+
+                        await upsertConversation(updatedRecord);
+
+                        // Trigger emergency alerts if needed
+                        if (analysis.immediateIntervention || analysis.tendency === 'severe') {
+                            console.log(`🚨 POST-CALL EMERGENCY ALERT - Severe risk detected for caller ${from}`);
+                            sendEmergencyAlert({
+                                callId: updatedRecord.id,
+                                phone: from,
+                                riskLevel: analysis.tendency,
+                                score: analysis.score,
+                                transcript: transcript,
+                                timestamp: new Date().toISOString(),
+                                isPostCall: true
+                            }).catch(err => console.error('Post-call emergency alert failed:', err));
+                        }
+
+                        return res.json({ ok: true, message: 'Transcript received and analyzed' });
+                    }
+                }
+            }
+            return res.json({ ok: true, message: 'Transcript event acknowledged' });
+        }
+
         if (eventType === 'call_ended' || eventType === 'end_call') {
             // Process final transcript and perform analysis when call ends
             console.log('📞 Call ended - processing final transcript');
             
             if (!callId) {
-                console.log('⚠️ No call ID in end call event, acknowledging...');
                 return res.json({ ok: true, message: 'No call ID provided' });
             }
 
             const existing = await getConversationById(callId);
             
-            // Extract transcript from various possible locations in the event
-            let transcript = event.transcript || 
-                           event.data?.transcript || 
-                           event.messages?.map(m => m.text).join(' ') || 
-                           event.conversation || 
-                           '';
-                           
-            const summary = event.summary || event.data?.summary || '';
+            // Try to get messages and recording
+            let transcript = '';
+            let recordingUrl = '';
             
-            // If no transcript in event, try to fetch from Ultravox API
-            if (!transcript) {
-                console.log('📥 No transcript in event, fetching from Ultravox API...');
-                try {
-                    // Try to get call details first
-                    const callDetails = await getUltravoxCallDetails(callId);
-                    console.log('Call details received:', JSON.stringify(callDetails, null, 2));
-                    
-                    // Extract transcript from call details
-                    transcript = callDetails.transcript || 
-                               callDetails.messages?.map(m => m.text || m.content).join(' ') || 
-                               callDetails.conversation || '';
-                    
-                    // If still no transcript, try dedicated transcript endpoint
-                    if (!transcript) {
-                        console.log('📥 Trying dedicated transcript endpoint...');
-                        const transcriptData = await getUltravoxTranscript(callId);
-                        
-                        if (Array.isArray(transcriptData)) {
-                            transcript = transcriptData.map(msg => msg.text || msg.content || msg.message).filter(Boolean).join(' ');
-                        } else if (transcriptData.transcript) {
-                            transcript = transcriptData.transcript;
-                        } else if (transcriptData.messages) {
-                            transcript = transcriptData.messages.map(m => m.text || m.content).join(' ');
-                        }
-                    }
-                } catch (transcriptError) {
-                    console.warn('Failed to fetch transcript from API:', transcriptError.message);
-                    console.log('📝 Will analyze available data without full transcript');
-                }
+            try {
+                // Get messages for transcript
+                const messagesData = await getUltravoxMessages(callId);
+                transcript = messagesData.transcript;
+                
+                // Get call details for recording URL
+                const callDetails = await getUltravoxCallDetails(callId);
+                recordingUrl = callDetails.recordingUrl || '';
+                
+                console.log(`📋 Transcript: ${transcript.length} characters`);
+                console.log(`🎵 Recording URL: ${recordingUrl}`);
+                
+            } catch (error) {
+                console.warn('Failed to fetch call data:', error.message);
             }
             
-            // If still no meaningful transcript, create a basic analysis from available data
-            if (!transcript || transcript.trim().length === 0) {
-                console.log('⚠️ No transcript available - creating analysis from call metadata');
-                transcript = `Call from ${from || 'unknown number'} - Duration and transcript not available`;
-            }
-            
-            console.log(`📋 Final transcript length: ${transcript.length} characters`);
-            console.log(`📋 Transcript preview: ${transcript.substring(0, 200)}...`);
-            
-            // Perform mental health analysis on the final transcript
-            const analysis = await classifyRiskAndCounselling(transcript);
+            // Continue with your analysis...
+            const analysis = await classifyRiskAndCounselling(transcript || 'No transcript available');
             
             const record = {
                 id: callId,
@@ -1016,7 +1281,8 @@ app.post('/ultravox/events', async (req, res) => {
                 createdAt: existing?.createdAt || new Date().toISOString(),
                 updatedAt: new Date().toISOString(),
                 transcript: transcript || existing?.transcript || '',
-                summary: summary || analysis.review,
+                recordingUrl: recordingUrl || existing?.recordingUrl || '',
+                summary: analysis.review,
                 tendency: analysis.tendency,
                 needsCounselling: analysis.needsCounselling,
                 score: analysis.score,
@@ -1028,22 +1294,7 @@ app.post('/ultravox/events', async (req, res) => {
             };
             
             await upsertConversation(record);
-
-            // Trigger emergency alerts if needed
-            if (analysis.immediateIntervention || analysis.tendency === 'severe') {
-                console.log(`🚨 POST-CALL EMERGENCY ALERT - Severe risk detected for caller ${from}`);
-                sendEmergencyAlert({
-                    callId: record.id,
-                    phone: from,
-                    riskLevel: analysis.tendency,
-                    score: analysis.score,
-                    transcript: transcript,
-                    timestamp: new Date().toISOString(),
-                    isPostCall: true
-                }).catch(err => console.error('Post-call emergency alert failed:', err));
-            }
-
-            console.log(`✅ Call analysis complete - Risk: ${analysis.tendency}, Score: ${analysis.score}`);
+            
             return res.json({ ok: true, riskAnalysis: analysis, message: 'Call ended and analyzed' });
         }
 
@@ -1064,6 +1315,19 @@ app.get('/api/conversations', async (_req, res) => {
     }
 });
 
+// API to list calls from Ultravox
+app.get('/api/ultravox/calls', async (req, res) => {
+    try {
+        const limit = parseInt(req.query.limit) || 50;
+        console.log(`Listing Ultravox calls (limit: ${limit})...`);
+        const calls = await listUltravoxCalls(limit);
+        res.json({ ok: true, calls, count: Array.isArray(calls) ? calls.length : 0 });
+    } catch (error) {
+        console.error('Error listing Ultravox calls:', error);
+        res.status(500).json({ ok: false, error: error.message });
+    }
+});
+
 // Manual endpoint to refresh transcript and analysis for a specific conversation
 app.post('/api/conversations/:id/refresh', async (req, res) => {
     try {
@@ -1076,41 +1340,59 @@ app.post('/api/conversations/:id/refresh', async (req, res) => {
         }
         
         let transcript = existing.transcript || '';
+        let recordingUrl = existing.recordingUrl || '';
         let updated = false;
+        
+        // First validate that the call exists in Ultravox
+        console.log('🔍 Validating call exists in Ultravox...');
+        try {
+            const callDetails = await getUltravoxCallDetails(callId);
+            console.log('✅ Call exists in Ultravox:', callDetails.id);
+        } catch (validationError) {
+            console.warn('⚠️ Call validation failed:', validationError.message);
+            // If call doesn't exist, mark as invalid but still allow analysis with existing data
+            if (validationError.message.includes('404') || validationError.message.includes('No Call matches')) {
+                console.log('📝 Call not found in Ultravox - proceeding with existing data analysis');
+            } else {
+                // For other errors, still try to proceed
+                console.log('📝 Call validation error - proceeding with transcript fetch attempt');
+            }
+        }
         
         // Try to fetch transcript from Ultravox API if missing or empty
         if (!transcript || transcript.trim().length === 0) {
-            console.log('📥 Fetching transcript from Ultravox API...');
+            console.log('📥 Fetching transcript from messages endpoint...');
             try {
-                // Try to get call details
+                // First try to get messages for transcript
+                const messagesData = await getUltravoxMessages(callId);
+                transcript = messagesData.transcript;
+                
+                // Get call details for recording URL
                 const callDetails = await getUltravoxCallDetails(callId);
-                console.log('Call details received for refresh:', JSON.stringify(callDetails, null, 2));
-                
-                // Extract transcript from call details
-                transcript = callDetails.transcript || 
-                           callDetails.messages?.map(m => m.text || m.content).join(' ') || 
-                           callDetails.conversation || '';
-                
-                // If still no transcript, try dedicated transcript endpoint
-                if (!transcript) {
-                    console.log('📥 Trying dedicated transcript endpoint...');
-                    const transcriptData = await getUltravoxTranscript(callId);
-                    
-                    if (Array.isArray(transcriptData)) {
-                        transcript = transcriptData.map(msg => msg.text || msg.content || msg.message).filter(Boolean).join(' ');
-                    } else if (transcriptData.transcript) {
-                        transcript = transcriptData.transcript;
-                    } else if (transcriptData.messages) {
-                        transcript = transcriptData.messages.map(m => m.text || m.content).join(' ');
-                    }
-                }
-                
+                recordingUrl = callDetails.recordingUrl || '';
+
                 if (transcript && transcript.trim().length > 0) {
                     updated = true;
                     console.log(`📋 New transcript retrieved: ${transcript.length} characters`);
                 }
             } catch (transcriptError) {
-                console.warn('Failed to fetch transcript from API during refresh:', transcriptError.message);
+                console.warn('Failed to fetch transcript from messages API during refresh:', transcriptError.message);
+                
+                // Fallback to old method
+                try {
+                    const callDetails = await getUltravoxCallDetails(callId);
+                    transcript = callDetails.transcript ||
+                               callDetails.transcriptText ||
+                               callDetails.messages?.map(m => m.text || m.content).filter(Boolean).join(' ') ||
+                               '';
+                    recordingUrl = callDetails.recordingUrl || '';
+                    if (transcript && transcript.trim().length > 0) {
+                        updated = true;
+                        console.log(`📋 Fallback transcript retrieved: ${transcript.length} characters`);
+                    }
+                } catch (fallbackError) {
+                    console.warn('Fallback transcript fetch also failed:', fallbackError.message);
+                }
             }
         }
         
@@ -1128,6 +1410,7 @@ app.post('/api/conversations/:id/refresh', async (req, res) => {
             detectedTerms: analysis.detectedTerms,
             immediateIntervention: analysis.immediateIntervention,
             geminiAnalysis: analysis.geminiAnalysis,
+            recordingUrl: recordingUrl || existing.recordingUrl || '',
             status: transcript ? 'completed' : 'no_transcript'
         };
         
@@ -1161,25 +1444,27 @@ app.post('/api/conversations/refresh-all', async (req, res) => {
                 console.log(`🔄 Refreshing conversation ${conv.id}...`);
                 
                 try {
-                    // Fetch transcript
+                    // Try messages endpoint first
                     let transcript = '';
-                    const callDetails = await getUltravoxCallDetails(conv.id);
-                    transcript = callDetails.transcript || 
-                               callDetails.messages?.map(m => m.text || m.content).join(' ') || 
-                               callDetails.conversation || '';
-                    
-                    if (!transcript) {
-                        const transcriptData = await getUltravoxTranscript(conv.id);
-                        if (Array.isArray(transcriptData)) {
-                            transcript = transcriptData.map(msg => msg.text || msg.content || msg.message).filter(Boolean).join(' ');
-                        } else if (transcriptData.transcript) {
-                            transcript = transcriptData.transcript;
-                        }
+                    try {
+                        const messagesData = await getUltravoxMessages(conv.id);
+                        transcript = messagesData.transcript;
+                        console.log(`📋 Messages transcript retrieved: ${transcript.length} characters`);
+                    } catch (messagesError) {
+                        console.warn(`Messages endpoint failed for ${conv.id}:`, messagesError.message);
+                        
+                        // Fallback to call details
+                        const callDetails = await getUltravoxCallDetails(conv.id);
+                        transcript = callDetails.transcript ||
+                                   callDetails.transcriptText ||
+                                   callDetails.messages?.map(m => m.text || m.content).filter(Boolean).join(' ') ||
+                                   '';
+                        console.log(`📋 Fallback transcript retrieved: ${transcript.length} characters`);
                     }
-                    
+
                     // Re-analyze
                     const analysis = await classifyRiskAndCounselling(transcript || 'No transcript available');
-                    
+
                     const updatedRecord = {
                         ...conv,
                         updatedAt: new Date().toISOString(),
@@ -1192,10 +1477,10 @@ app.post('/api/conversations/refresh-all', async (req, res) => {
                         immediateIntervention: analysis.immediateIntervention,
                         geminiAnalysis: analysis.geminiAnalysis
                     };
-                    
+
                     await upsertConversation(updatedRecord);
                     results.push({ id: conv.id, status: 'updated', transcriptLength: transcript.length });
-                    
+
                 } catch (error) {
                     console.error(`Failed to refresh conversation ${conv.id}:`, error);
                     results.push({ id: conv.id, status: 'failed', error: error.message });
@@ -1211,6 +1496,201 @@ app.post('/api/conversations/refresh-all', async (req, res) => {
     } catch (error) {
         console.error('Error in batch refresh:', error);
         res.status(500).json({ ok: false, error: 'Internal server error' });
+    }
+});
+
+// Import actual calls from Ultravox endpoint
+app.post('/api/conversations/import-from-ultravox', async (req, res) => {
+    try {
+        console.log('📥 Starting import of calls from Ultravox...');
+        const limit = parseInt(req.body.limit) || 20;
+        
+        // Fetch actual calls from Ultravox
+        const calls = await listUltravoxCalls(limit);
+        console.log(`📋 Fetched ${Array.isArray(calls) ? calls.length : 0} calls from Ultravox`);
+        
+        const results = [];
+        
+        if (Array.isArray(calls)) {
+            for (const call of calls) {
+                try {
+                    const callId = call.id || call.callId;
+                    if (!callId) {
+                        results.push({ id: 'unknown', status: 'skipped', message: 'No call ID found' });
+                        continue;
+                    }
+                    
+                    // Check if we already have this call
+                    const existing = await getConversationById(callId);
+                    if (existing) {
+                        console.log(`✅ Call ${callId} already exists - refreshing...`);
+                        // Try messages endpoint first, then fallback
+                        let transcript = '';
+                        try {
+                            const messagesData = await getUltravoxMessages(callId);
+                            transcript = messagesData.transcript;
+                        } catch (messagesError) {
+                            console.warn(`Messages failed for ${callId}, trying fallback:`, messagesError.message);
+                            const callDetails = await getUltravoxCallDetails(callId);
+                            transcript = callDetails.transcript ||
+                                       callDetails.transcriptText ||
+                                       callDetails.messages?.map(m => m.text || m.content).filter(Boolean).join(' ') ||
+                                       '';
+                        }
+                        
+                        // Get recording URL from call details
+                        const callDetails = await getUltravoxCallDetails(callId);
+                        const recordingUrl = callDetails.recordingUrl ||
+                                           callDetails.recording_url ||
+                                           callDetails.audioUrl ||
+                                           callDetails.media?.audioUrl ||
+                                           '';
+                        
+                        if (transcript || recordingUrl) {
+                            const analysis = await classifyRiskAndCounselling(transcript || '');
+                            const updatedRecord = {
+                                ...existing,
+                                updatedAt: new Date().toISOString(),
+                                transcript: transcript || existing.transcript || '',
+                                recordingUrl: recordingUrl || existing.recordingUrl || '',
+                                summary: analysis.review,
+                                tendency: analysis.tendency,
+                                needsCounselling: analysis.needsCounselling,
+                                score: analysis.score,
+                                detectedTerms: analysis.detectedTerms,
+                                immediateIntervention: analysis.immediateIntervention,
+                                geminiAnalysis: analysis.geminiAnalysis,
+                                status: 'imported_updated'
+                            };
+                            await upsertConversation(updatedRecord);
+                            results.push({ id: callId, status: 'updated', message: 'Existing call refreshed with new data' });
+                        } else {
+                            results.push({ id: callId, status: 'unchanged', message: 'No new transcript or recording data' });
+                        }
+                    } else {
+                        // Create new call record
+                        console.log(`🆕 Importing new call ${callId}...`);
+                        
+                        // Try messages endpoint first for transcript
+                        let transcript = '';
+                        try {
+                            const messagesData = await getUltravoxMessages(callId);
+                            transcript = messagesData.transcript;
+                        } catch (messagesError) {
+                            console.warn(`Messages failed for ${callId}, trying fallback:`, messagesError.message);
+                            const callDetails = await getUltravoxCallDetails(callId);
+                            transcript = callDetails.transcript ||
+                                       callDetails.transcriptText ||
+                                       callDetails.messages?.map(m => m.text || m.content).filter(Boolean).join(' ') ||
+                                       '';
+                        }
+                        
+                        // Get call details for recording URL
+                        const callDetails = await getUltravoxCallDetails(callId);
+                        const recordingUrl = callDetails.recordingUrl ||
+                                           callDetails.recording_url ||
+                                           callDetails.audioUrl ||
+                                           callDetails.media?.audioUrl ||
+                                           '';
+                        
+                        const analysis = await classifyRiskAndCounselling(transcript || 'Imported call - no transcript available');
+                        
+                        const newRecord = {
+                            id: callId,
+                            from: call.from || call.caller || 'unknown',
+                            createdAt: call.createdAt || call.created_at || new Date().toISOString(),
+                            updatedAt: new Date().toISOString(),
+                            transcript: transcript,
+                            recordingUrl: recordingUrl,
+                            summary: analysis.review,
+                            tendency: analysis.tendency,
+                            needsCounselling: analysis.needsCounselling,
+                            score: analysis.score,
+                            detectedTerms: analysis.detectedTerms,
+                            immediateIntervention: analysis.immediateIntervention,
+                            geminiAnalysis: analysis.geminiAnalysis,
+                            status: 'imported',
+                            raw: { importedCall: call, importedDetails: callDetails }
+                        };
+                        
+                        await upsertConversation(newRecord);
+                        results.push({ id: callId, status: 'created', message: 'New call imported successfully' });
+                    }
+                } catch (callError) {
+                    console.error(`Error processing call:`, callError);
+                    results.push({ id: call.id || 'unknown', status: 'error', message: callError.message });
+                }
+            }
+        }
+        
+        const created = results.filter(r => r.status === 'created').length;
+        const updated = results.filter(r => r.status === 'updated').length;
+        const errors = results.filter(r => r.status === 'error').length;
+        
+        console.log(`📥 Import complete: ${created} created, ${updated} updated, ${errors} errors`);
+        
+        res.json({
+            ok: true,
+            summary: {
+                total: results.length,
+                created,
+                updated,
+                errors,
+                unchanged: results.filter(r => r.status === 'unchanged').length
+            },
+            results,
+            message: `Imported ${created} new calls, updated ${updated} existing calls`
+        });
+    } catch (error) {
+        console.error('Error during import:', error);
+        res.status(500).json({ ok: false, error: error.message });
+    }
+});
+
+// Cleanup invalid calls endpoint - remove calls that don't exist in Ultravox
+app.post('/api/conversations/cleanup-invalid', async (req, res) => {
+    try {
+        console.log('🧹 Starting cleanup of invalid calls...');
+        const conversations = await getConversations();
+        const results = [];
+        
+        for (const conv of conversations) {
+            try {
+                // Try to validate each call exists in Ultravox
+                console.log(`🔍 Checking call ${conv.id}...`);
+                await getUltravoxCallDetails(conv.id);
+                console.log(`✅ Call ${conv.id} exists in Ultravox`);
+                results.push({ id: conv.id, status: 'valid', message: 'Exists in Ultravox' });
+            } catch (error) {
+                if (error.message.includes('404') || error.message.includes('No Call matches')) {
+                    console.log(`❌ Call ${conv.id} not found in Ultravox - marking for cleanup`);
+                    results.push({ id: conv.id, status: 'invalid', message: 'Not found in Ultravox', error: error.message });
+                } else {
+                    console.log(`⚠️ Error checking call ${conv.id}: ${error.message}`);
+                    results.push({ id: conv.id, status: 'error', message: error.message });
+                }
+            }
+        }
+        
+        const invalidCalls = results.filter(r => r.status === 'invalid');
+        const validCalls = results.filter(r => r.status === 'valid');
+        
+        console.log(`🧹 Cleanup complete: ${validCalls.length} valid, ${invalidCalls.length} invalid`);
+        
+        res.json({
+            ok: true,
+            summary: {
+                total: conversations.length,
+                valid: validCalls.length,
+                invalid: invalidCalls.length,
+                errors: results.filter(r => r.status === 'error').length
+            },
+            results,
+            message: `Found ${invalidCalls.length} calls that don't exist in Ultravox`
+        });
+    } catch (error) {
+        console.error('Error during cleanup:', error);
+        res.status(500).json({ ok: false, error: error.message });
     }
 });
 
@@ -1238,6 +1718,11 @@ app.get('/dashboard', async (_req, res) => {
             const transcriptStatus = hasTranscript ? 
                 `${c.transcript.length} chars` : 
                 '<span style="color:#dc2626;">No transcript</span>';
+            
+            const hasRecording = c.recordingUrl && c.recordingUrl.trim().length > 0;
+            const recordingStatus = hasRecording ? 
+                `<a href="${c.recordingUrl}" target="_blank" style="color:#059669;text-decoration:none;" title="Play Recording">🎵 Audio</a>` : 
+                '<span style="color:#dc2626;">No recording</span>';
                 
             return `
             <tr ${c.immediateIntervention ? 'style="background-color:#fef2f2;border-left:4px solid #dc2626;"' : ''}>
@@ -1247,6 +1732,7 @@ app.get('/dashboard', async (_req, res) => {
                 <td style="font-family:sans-serif;padding:8px;font-size:12px;">${new Date(c.updatedAt).toLocaleString()}</td>
                 <td style="font-family:sans-serif;padding:8px;">${badge(c.status || 'unknown')}</td>
                 <td style="font-family:sans-serif;padding:8px;">${transcriptStatus}</td>
+                <td style="font-family:sans-serif;padding:8px;">${recordingStatus}</td>
                 <td style="font-family:sans-serif;padding:8px;">${badge(c.tendency)}</td>
                 <td style="font-family:sans-serif;padding:8px;">${badge(c.needsCounselling)}</td>
                 <td style="font-family:sans-serif;padding:8px;text-align:center;">${c.score || 0}</td>
@@ -1263,6 +1749,7 @@ app.get('/dashboard', async (_req, res) => {
         const highRiskCount = convs.filter(c => c.tendency === 'high').length;
         const missingTranscripts = convs.filter(c => !c.transcript || c.transcript.trim().length === 0).length;
         const withGeminiAnalysis = convs.filter(c => c.geminiAnalysis).length;
+        const withRecordings = convs.filter(c => c.recordingUrl && c.recordingUrl.trim().length > 0).length;
 
         const html = `<!doctype html>
         <html>
@@ -1304,6 +1791,8 @@ app.get('/dashboard', async (_req, res) => {
             
             <div class="actions">
                 <button class="btn btn-primary" onclick="refreshAllConversations()">🔄 Refresh All Missing Transcripts</button>
+                <button class="btn btn-primary" onclick="importFromUltravox()" style="background:#059669;">📥 Import from Ultravox</button>
+                <button class="btn btn-secondary" onclick="cleanupInvalidCalls()" style="background:#dc2626;">🧹 Cleanup Invalid Calls</button>
                 <button class="btn btn-secondary" onclick="location.reload()">🔃 Reload Dashboard</button>
                 <span class="loading" id="loading">⏳ Processing...</span>
                 <div id="result" style="margin-top:10px;"></div>
@@ -1330,6 +1819,10 @@ app.get('/dashboard', async (_req, res) => {
                     <div class="stat-number">${withGeminiAnalysis}</div>
                     <div class="stat-label">🤖 AI Analyzed</div>
                 </div>
+                <div class="stat-card" style="background:#e0f2fe;">
+                    <div class="stat-number">${withRecordings}</div>
+                    <div class="stat-label">🎵 With Recording</div>
+                </div>
             </div>
             
             <table border="1" cellspacing="0" cellpadding="0" style="border-collapse:collapse;min-width:1400px;">
@@ -1341,6 +1834,7 @@ app.get('/dashboard', async (_req, res) => {
                         <th style="padding:8px;text-align:left;">Updated</th>
                         <th style="padding:8px;text-align:left;">Status</th>
                         <th style="padding:8px;text-align:left;">Transcript</th>
+                        <th style="padding:8px;text-align:left;">Recording</th>
                         <th style="padding:8px;text-align:left;">Risk Level</th>
                         <th style="padding:8px;text-align:left;">Counselling</th>
                         <th style="padding:8px;text-align:left;">Score</th>
@@ -1399,6 +1893,55 @@ app.get('/dashboard', async (_req, res) => {
                             const failed = result.results.filter(r => r.status === 'failed').length;
                             document.getElementById('result').innerHTML = \`<div style="color:green;">✅ Processed \${result.results.length} conversations: \${updated} updated, \${failed} failed</div>\`;
                             setTimeout(() => location.reload(), 3000);
+                        } else {
+                            document.getElementById('result').innerHTML = \`<div style="color:red;">❌ \${result.error}</div>\`;
+                        }
+                    } catch (error) {
+                        document.getElementById('loading').style.display = 'none';
+                        document.getElementById('result').innerHTML = \`<div style="color:red;">❌ Error: \${error.message}</div>\`;
+                    }
+                }
+                
+                async function importFromUltravox() {
+                    try {
+                        document.getElementById('loading').style.display = 'inline';
+                        const response = await fetch('/api/conversations/import-from-ultravox', { 
+                            method: 'POST',
+                            headers: { 'Content-Type': 'application/json' },
+                            body: JSON.stringify({ limit: 20 })
+                        });
+                        const result = await response.json();
+                        document.getElementById('loading').style.display = 'none';
+                        
+                        if (result.ok) {
+                            const created = result.summary.created;
+                            const updated = result.summary.updated;
+                            document.getElementById('result').innerHTML = \`<div style="color:green;">📥 Import complete: \${created} new calls, \${updated} updated calls</div>\`;
+                            setTimeout(() => location.reload(), 3000);
+                        } else {
+                            document.getElementById('result').innerHTML = \`<div style="color:red;">❌ \${result.error}</div>\`;
+                        }
+                    } catch (error) {
+                        document.getElementById('loading').style.display = 'none';
+                        document.getElementById('result').innerHTML = \`<div style="color:red;">❌ Error: \${error.message}</div>\`;
+                    }
+                }
+                
+                async function cleanupInvalidCalls() {
+                    try {
+                        document.getElementById('loading').style.display = 'inline';
+                        const response = await fetch('/api/conversations/cleanup-invalid', { 
+                            method: 'POST',
+                            headers: { 'Content-Type': 'application/json' }
+                        });
+                        const result = await response.json();
+                        document.getElementById('loading').style.display = 'none';
+                        
+                        if (result.ok) {
+                            const invalid = result.summary.invalid;
+                            const valid = result.summary.valid;
+                            document.getElementById('result').innerHTML = \`<div style="color:green;">🧹 Cleanup complete: \${valid} valid calls, \${invalid} invalid calls found</div>\`;
+                            setTimeout(() => location.reload(), 2000);
                         } else {
                             document.getElementById('result').innerHTML = \`<div style="color:red;">❌ \${result.error}</div>\`;
                         }
@@ -1484,6 +2027,7 @@ app.get('/conversations/:id', (req, res) => {
             <p><strong>Created:</strong> ${new Date(c.createdAt).toLocaleString()}</p>
             <p><strong>Updated:</strong> ${new Date(c.updatedAt).toLocaleString()}</p>
             <p><strong>Status:</strong> <span class="badge ${c.status || 'unknown'}">${c.status || 'unknown'}</span></p>
+            ${c.recordingUrl ? `<p><strong>Recording:</strong> <a href="${c.recordingUrl}" target="_blank" style="color:#059669;text-decoration:none;">🎵 Play Audio Recording</a></p>` : '<p><strong>Recording:</strong> <span style="color:#6b7280;">No recording available</span></p>'}
         </div>
         
         <div style="background:#f0f9ff;padding:20px;border-radius:8px;margin:20px 0;">
@@ -1510,6 +2054,26 @@ app.get('/conversations/:id', (req, res) => {
                 '<p style="color:#6b7280;font-style:italic;">No transcript available</p>'
             }
         </div>
+        
+        ${c.recordingUrl ? `
+        <h3>🎵 Call Recording</h3>
+        <div style="background:#f0f9ff;padding:20px;border-radius:8px;border:1px solid #dbeafe;margin:20px 0;">
+            <div style="margin-bottom:10px;">
+                <audio controls style="width:100%;max-width:500px;">
+                    <source src="${c.recordingUrl}" type="audio/mpeg">
+                    <source src="${c.recordingUrl}" type="audio/wav">
+                    <source src="${c.recordingUrl}" type="audio/ogg">
+                    Your browser does not support the audio element.
+                </audio>
+            </div>
+            <p style="margin:5px 0;font-size:12px;color:#6b7280;">
+                <strong>Direct link:</strong> <a href="${c.recordingUrl}" target="_blank" style="color:#059669;">${c.recordingUrl}</a>
+            </p>
+            <p style="margin:5px 0;font-size:12px;color:#6b7280;">
+                💡 <em>Tip: Right-click the audio player and select "Download" to save the recording locally.</em>
+            </p>
+        </div>
+        ` : ''}
         
         <h3>🔧 Raw Data</h3>
         <details style="margin:20px 0;">
