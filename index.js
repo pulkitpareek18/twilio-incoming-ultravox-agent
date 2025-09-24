@@ -161,7 +161,7 @@ if (GEMINI_API_KEY) {
 // Small helper to render colored badges in the dashboard
 function badge(label) {
     const safe = String(label || '').toLowerCase();
-    const classes = ['no','low','medium','high','severe','yes','advised'];
+    const classes = ['no','low','medium','high','severe','yes','advised','active','completed','unknown'];
     const cls = classes.includes(safe) ? safe : 'no';
     return `<span class="badge ${cls}">${safe || 'no'}</span>`;
 }
@@ -665,66 +665,116 @@ app.post('/ultravox/events', async (req, res) => {
         console.log('Received Ultravox event:', JSON.stringify(req.body, null, 2));
         
         const event = req.body || {};
-        // Attempt to extract call identity and transcript/summary
-        const callId = event.id || event.callId || event.call_id || event.data?.callId;
-        const from = event.from || event.caller || event.data?.from;
-        const transcript = event.transcript || event.data?.transcript || '';
-        const summary = event.summary || event.data?.summary || '';
-        const eventType = event.type || event.event_type || 'unknown';
+        // Extract call data based on Ultravox webhook structure
+        const callId = event.id || event.callId || event.call_id || event.data?.callId || event.data?.id;
+        const from = event.from || event.caller || event.data?.from || event.data?.caller;
+        const eventType = event.type || event.event_type || event.event || 'unknown';
+        
+        // Handle different Ultravox event types
+        console.log(`🔔 Ultravox Event: ${eventType} for call: ${callId}`);
 
-        console.log(`Processing event type: ${eventType} for call: ${callId}`);
-
-        if (!callId && !transcript) {
-            console.log('No actionable data in event, acknowledging...');
-            return res.json({ ok: true });
+        if (eventType === 'call_started' || eventType === 'start_call') {
+            // Initialize call record when call starts
+            console.log('📞 Call started - initializing record');
+            const record = {
+                id: callId || `call_${Date.now()}`,
+                from: from || 'unknown',
+                createdAt: new Date().toISOString(),
+                updatedAt: new Date().toISOString(),
+                transcript: '',
+                summary: 'Call in progress...',
+                tendency: 'no',
+                needsCounselling: 'no',
+                score: 0,
+                detectedTerms: [],
+                immediateIntervention: false,
+                status: 'active',
+                raw: { startEvent: event }
+            };
+            await upsertConversation(record);
+            return res.json({ ok: true, message: 'Call started, tracking initialized' });
         }
 
-        const existing = callId ? await getConversationById(callId) : undefined;
-        const analysis = await classifyRiskAndCounselling(transcript);
-        
-        const record = {
-            id: callId || (existing?.id || `call_${Date.now()}`),
-            from: from || existing?.from || 'unknown',
-            createdAt: existing?.createdAt || new Date().toISOString(),
-            updatedAt: new Date().toISOString(),
-            transcript: transcript || existing?.transcript || '',
-            summary: summary || analysis.review,
-            tendency: analysis.tendency,
-            needsCounselling: analysis.needsCounselling,
-            score: analysis.score,
-            detectedTerms: analysis.detectedTerms,
-            immediateIntervention: analysis.immediateIntervention,
-            geminiAnalysis: analysis.geminiAnalysis,
-            raw: { ...(existing?.raw || {}), event }
-        };
-        
-        await upsertConversation(record);
+        if (eventType === 'call_joined' || eventType === 'joined_call') {
+            // Update call record when participants join
+            console.log('👥 Participant joined call');
+            const existing = callId ? await getConversationById(callId) : null;
+            if (existing) {
+                existing.updatedAt = new Date().toISOString();
+                existing.status = 'participants_joined';
+                existing.raw = { ...(existing.raw || {}), joinEvent: event };
+                await upsertConversation(existing);
+            }
+            return res.json({ ok: true, message: 'Call join recorded' });
+        }
 
-        // Real-time intervention for severe cases during active calls
-        if ((analysis.immediateIntervention || analysis.tendency === 'severe') && eventType !== 'call_ended') {
-            console.log(`🚨 REAL-TIME ALERT - Severe risk detected DURING CALL for caller ${from}`);
-            console.log(`Event Type: ${eventType}, Risk Score: ${analysis.score}`);
+        if (eventType === 'call_ended' || eventType === 'end_call') {
+            // Process final transcript and perform analysis when call ends
+            console.log('📞 Call ended - processing final transcript');
             
-            // Immediate emergency response during active call
-            sendEmergencyAlert({
-                callId: record.id,
-                phone: from,
-                riskLevel: analysis.tendency,
-                score: analysis.score,
-                transcript: transcript,
-                timestamp: new Date().toISOString(),
-                isLiveCall: eventType !== 'call_ended',
-                eventType: eventType
-            }).catch(err => console.error('Real-time emergency alert failed:', err));
+            // Extract transcript from various possible locations in the event
+            const transcript = event.transcript || 
+                             event.data?.transcript || 
+                             event.messages?.map(m => m.text).join(' ') || 
+                             event.conversation || 
+                             '';
+                             
+            const summary = event.summary || event.data?.summary || '';
+            
+            if (!callId) {
+                console.log('⚠️ No call ID in end call event, acknowledging...');
+                return res.json({ ok: true, message: 'No call ID provided' });
+            }
 
-            // You could also implement:
-            // - Send immediate SMS to crisis counselors
-            // - Trigger conference call with mental health professional
-            // - Send push notifications to mobile crisis response team
-            // - Update AI agent's system prompt to include crisis de-escalation
+            const existing = await getConversationById(callId);
+            
+            // Perform mental health analysis on the final transcript
+            const analysis = transcript ? await classifyRiskAndCounselling(transcript) : {
+                tendency: 'no',
+                needsCounselling: 'no',
+                review: 'No transcript available for analysis',
+                score: 0,
+                detectedTerms: [],
+                immediateIntervention: false
+            };
+            
+            const record = {
+                id: callId,
+                from: from || existing?.from || 'unknown',
+                createdAt: existing?.createdAt || new Date().toISOString(),
+                updatedAt: new Date().toISOString(),
+                transcript: transcript || existing?.transcript || '',
+                summary: summary || analysis.review,
+                tendency: analysis.tendency,
+                needsCounselling: analysis.needsCounselling,
+                score: analysis.score,
+                detectedTerms: analysis.detectedTerms,
+                immediateIntervention: analysis.immediateIntervention,
+                geminiAnalysis: analysis.geminiAnalysis,
+                status: 'completed',
+                raw: { ...(existing?.raw || {}), endEvent: event }
+            };
+            
+            await upsertConversation(record);
+
+            // Trigger emergency alerts if needed
+            if (analysis.immediateIntervention || analysis.tendency === 'severe') {
+                console.log(`🚨 POST-CALL EMERGENCY ALERT - Severe risk detected for caller ${from}`);
+                sendEmergencyAlert({
+                    callId: record.id,
+                    phone: from,
+                    riskLevel: analysis.tendency,
+                    score: analysis.score,
+                    transcript: transcript,
+                    timestamp: new Date().toISOString(),
+                    isPostCall: true
+                }).catch(err => console.error('Post-call emergency alert failed:', err));
+            }
+
+            console.log(`✅ Call analysis complete - Risk: ${analysis.tendency}, Score: ${analysis.score}`);
+            return res.json({ ok: true, riskAnalysis: analysis, message: 'Call ended and analyzed' });
         }
 
-        res.json({ ok: true, riskAnalysis: analysis });
     } catch (error) {
         console.error('Error in Ultravox webhook:', error);
         res.status(500).json({ ok: false, error: 'Internal server error' });
@@ -767,6 +817,7 @@ app.get('/dashboard', async (_req, res) => {
                 <td style="font-family:sans-serif;padding:8px;">${c.from}</td>
                 <td style="font-family:sans-serif;padding:8px;">${new Date(c.createdAt).toLocaleString()}</td>
                 <td style="font-family:sans-serif;padding:8px;">${new Date(c.updatedAt).toLocaleString()}</td>
+                <td style="font-family:sans-serif;padding:8px;">${badge(c.status || 'unknown')}</td>
                 <td style="font-family:sans-serif;padding:8px;">${badge(c.tendency)}</td>
                 <td style="font-family:sans-serif;padding:8px;">${badge(c.needsCounselling)}</td>
                 <td style="font-family:sans-serif;padding:8px;text-align:center;">${c.score || 0}</td>
@@ -793,6 +844,9 @@ app.get('/dashboard', async (_req, res) => {
                 .severe{background:#7f1d1d}
                 .yes{background:#ef4444}
                 .advised{background:#f59e0b}
+                .active{background:#3b82f6}
+                .completed{background:#10b981}
+                .unknown{background:#6b7280}
                 .stats{display:flex;gap:20px;margin:20px 0;}
                 .stat-card{background:#f8f9fa;padding:15px;border-radius:8px;text-align:center;min-width:120px;}
                 .stat-number{font-size:24px;font-weight:bold;color:#333;}
@@ -819,13 +873,14 @@ app.get('/dashboard', async (_req, res) => {
                 </div>
             </div>
             
-            <table border="1" cellspacing="0" cellpadding="0" style="border-collapse:collapse;min-width:1100px;margin-top:20px;">
+            <table border="1" cellspacing="0" cellpadding="0" style="border-collapse:collapse;min-width:1200px;margin-top:20px;">
                 <thead style="background:#f1f5f9;">
                     <tr>
                         <th style="padding:8px;text-align:left;">Call ID</th>
                         <th style="padding:8px;text-align:left;">Phone</th>
                         <th style="padding:8px;text-align:left;">Started</th>
                         <th style="padding:8px;text-align:left;">Updated</th>
+                        <th style="padding:8px;text-align:left;">Status</th>
                         <th style="padding:8px;text-align:left;">Risk Level</th>
                         <th style="padding:8px;text-align:left;">Counselling</th>
                         <th style="padding:8px;text-align:left;">Score</th>
