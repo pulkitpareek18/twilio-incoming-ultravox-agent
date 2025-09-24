@@ -60,6 +60,8 @@ const ULTRAVOX_CALL_CONFIG = {
     temperature: ULTRAVOX_TEMPERATURE, // Increased for more natural, conversational responses
     firstSpeaker: FIRST_SPEAKER,
     medium: { twilio: {} },
+    recordingEnabled: true, // Enable recording to ensure transcript generation
+    transcriptOptional: false, // Make transcript required
     // If Ultravox supports event callbacks, allow setting via env
     // eventWebhookUrl is not a valid field for StartCallRequest and has been removed
 };
@@ -287,47 +289,142 @@ async function classifyRiskAndCounselling(transcriptText) {
 
 TRANSCRIPT: "${transcriptText}"
 
-Please provide:
-1. Risk level (no/low/medium/high/severe)
-2. Counseling recommendation (no/advised/yes)
-3. Key concerning phrases or patterns you detected
-4. Brief explanation of your assessment
-5. Immediate intervention needed? (yes/no)
-6. Language used (Hindi/English/Mixed)
+Please provide a comprehensive mental health risk assessment:
 
-Consider both English and Hindi expressions of distress, suicidal ideation, hopelessness, and mental health concerns.
+1. **Risk level**: Classify as no/low/medium/high/severe based on:
+   - Direct suicidal statements or self-harm mentions
+   - Hopelessness and despair indicators
+   - Plans or methods mentioned
+   - Social isolation and withdrawal
+   - Substance abuse references
+   - Past trauma or abuse mentions
+
+2. **Counseling recommendation**: Determine if professional help is needed (no/advised/yes)
+
+3. **Key concerning phrases**: List specific phrases that indicate distress (both Hindi and English)
+
+4. **Language analysis**: What language(s) were primarily used (Hindi/English/Mixed)
+
+5. **Emotional state**: Describe the caller's primary emotional state
+
+6. **Immediate intervention needed**: Is there imminent danger? (yes/no)
+
+7. **Support recommendations**: What type of support would be most beneficial?
+
+Consider both English and Hindi expressions of distress, suicidal ideation, hopelessness, and mental health concerns. Hindi terms like "marna chahta hun", "jaan dena", "zindagi khatam", "pareshan hun", "depression hai" should be weighted appropriately.
 
 Respond in JSON format:
 {
-  "risk_level": "...",
-  "counseling_needed": "...", 
-  "concerning_phrases": [...],
-  "assessment": "...",
-  "immediate_intervention": "...",
-  "language": "..."
+  "risk_level": "no|low|medium|high|severe",
+  "counseling_needed": "no|advised|yes", 
+  "concerning_phrases": ["phrase1", "phrase2", ...],
+  "language_used": "Hindi|English|Mixed",
+  "emotional_state": "brief description",
+  "immediate_intervention": "yes|no",
+  "support_recommendations": "brief recommendations",
+  "assessment_summary": "2-3 sentence summary of analysis",
+  "confidence_level": "low|medium|high"
 }`;
 
             const result = await model.generateContent(prompt);
             const response = await result.response;
             const aiText = response.text();
             
+            console.log('Gemini raw response:', aiText);
+            
             // Try to parse JSON response
             const jsonMatch = aiText.match(/\{[\s\S]*\}/);
             if (jsonMatch) {
-                geminiAnalysis = JSON.parse(jsonMatch[0]);
-                
-                // Override if AI detected higher risk
-                if (geminiAnalysis.risk_level === 'severe' && tendency !== 'severe') {
-                    tendency = 'severe';
-                    needsCounselling = 'yes';
-                    score += 3;
+                try {
+                    geminiAnalysis = JSON.parse(jsonMatch[0]);
+                    console.log('Gemini parsed analysis:', geminiAnalysis);
+                    
+                    // Override if AI detected higher risk (AI analysis takes precedence)
+                    const aiRiskLevels = { 'no': 0, 'low': 1, 'medium': 2, 'high': 3, 'severe': 4 };
+                    const currentRiskLevel = aiRiskLevels[tendency] || 0;
+                    const aiRiskLevel = aiRiskLevels[geminiAnalysis.risk_level] || 0;
+                    
+                    if (aiRiskLevel > currentRiskLevel) {
+                        console.log(`AI detected higher risk: ${geminiAnalysis.risk_level} vs ${tendency}`);
+                        tendency = geminiAnalysis.risk_level;
+                        score = Math.max(score, aiRiskLevel * 3); // Boost score based on AI assessment
+                    }
+                    
+                    // Update counseling recommendation based on AI analysis
+                    if (geminiAnalysis.counseling_needed === 'yes' && needsCounselling !== 'yes') {
+                        needsCounselling = 'yes';
+                    } else if (geminiAnalysis.counseling_needed === 'advised' && needsCounselling === 'no') {
+                        needsCounselling = 'advised';
+                    }
+                    
+                } catch (parseError) {
+                    console.warn('Failed to parse Gemini JSON response:', parseError);
+                    // Try to extract key information from text response
+                    geminiAnalysis = {
+                        risk_level: aiText.match(/risk[_\s]*level[:\s]*["']?(\w+)["']?/i)?.[1] || tendency,
+                        counseling_needed: aiText.match(/counseling[_\s]*needed[:\s]*["']?(\w+)["']?/i)?.[1] || needsCounselling,
+                        assessment_summary: aiText.substring(0, 200) + '...',
+                        raw_response: aiText
+                    };
                 }
-                if (geminiAnalysis.counseling_needed === 'yes' && needsCounselling !== 'yes') {
-                    needsCounselling = 'yes';
-                }
+            } else {
+                // No JSON found, create basic structure
+                geminiAnalysis = {
+                    assessment_summary: aiText.substring(0, 200) + '...',
+                    raw_response: aiText,
+                    parse_error: 'No JSON structure found in response'
+                };
             }
         } catch (e) {
             console.warn('Gemini classification failed; using rule-based fallback:', e);
+            geminiAnalysis = {
+                error: e.message,
+                fallback_used: true
+            };
+        }
+    } else if (gemini) {
+        // Gemini available but no transcript - analyze metadata
+        try {
+            const model = gemini.getGenerativeModel({ model: GEMINI_MODEL });
+            const prompt = `Analyze this limited conversation data for potential mental health concerns. No full transcript is available.
+
+Available information:
+- Call initiated from phone number
+- Duration: likely short (transcript not available)
+- Context: Mental health support hotline call
+- Agent: Hindi-speaking supportive friend named Arjun
+
+Based on the fact that someone called a mental health support line but no transcript was captured:
+
+1. Should this be flagged for follow-up? (yes/no)
+2. What's the likely risk level given they called for support? (no/low/medium/high/severe)
+3. Is counseling recommended? (no/advised/yes)
+
+Respond in JSON format:
+{
+  "risk_level": "low",
+  "counseling_needed": "advised", 
+  "assessment_summary": "Caller reached out for mental health support - transcript unavailable but indicates help-seeking behavior",
+  "follow_up_needed": "yes",
+  "confidence_level": "low"
+}`;
+
+            const result = await model.generateContent(prompt);
+            const response = await result.response;
+            const aiText = response.text();
+            
+            const jsonMatch = aiText.match(/\{[\s\S]*\}/);
+            if (jsonMatch) {
+                geminiAnalysis = JSON.parse(jsonMatch[0]);
+                // Update based on AI assessment for calls without transcript
+                if (tendency === 'no') {
+                    tendency = geminiAnalysis.risk_level || 'low';
+                    needsCounselling = geminiAnalysis.counseling_needed || 'advised';
+                    score = 2; // Minimum score for help-seeking behavior
+                }
+            }
+        } catch (e) {
+            console.warn('Gemini metadata analysis failed:', e);
         }
     }
 
@@ -414,6 +511,147 @@ async function createUltravoxCall(config = ULTRAVOX_CALL_CONFIG) {
 
         request.write(postData);
         request.end();
+    });
+}
+
+// Retrieve call details and transcript from Ultravox API
+async function getUltravoxCallDetails(callId) {
+    return new Promise((resolve, reject) => {
+        if (!ULTRAVOX_API_KEY) {
+            reject(new Error('ULTRAVOX_API_KEY is required'));
+            return;
+        }
+
+        const apiUrl = `${ULTRAVOX_API_URL}/${callId}`;
+        console.log(`Fetching call details from: ${apiUrl}`);
+
+        const request = https.request(apiUrl, {
+            method: 'GET',
+            headers: {
+                'Content-Type': 'application/json',
+                'X-API-Key': ULTRAVOX_API_KEY
+            },
+            timeout: 10000
+        });
+
+        let data = '';
+
+        request.on('response', (response) => {
+            console.log(`Ultravox call details response status: ${response.statusCode}`);
+            
+            response.on('data', chunk => data += chunk);
+            response.on('end', () => {
+                console.log(`Ultravox call details response: ${data}`);
+                try {
+                    const parsed = JSON.parse(data || '{}');
+                    if (response.statusCode >= 400) {
+                        reject(new Error(`Ultravox API error ${response.statusCode}: ${data}`));
+                    } else {
+                        resolve(parsed);
+                    }
+                } catch (e) {
+                    console.error('Failed parsing Ultravox call details response:', e, data);
+                    reject(new Error(`Failed to parse Ultravox response: ${data}`));
+                }
+            });
+        });
+
+        request.on('error', (error) => {
+            console.error('Ultravox call details request error:', error);
+            reject(error);
+        });
+
+        request.on('timeout', () => {
+            console.error('Ultravox call details request timeout');
+            request.destroy();
+            reject(new Error('Ultravox call details request timeout'));
+        });
+
+        request.end();
+    });
+}
+
+// Retrieve transcript from Ultravox API - additional endpoint
+async function getUltravoxTranscript(callId) {
+    return new Promise((resolve, reject) => {
+        if (!ULTRAVOX_API_KEY) {
+            reject(new Error('ULTRAVOX_API_KEY is required'));
+            return;
+        }
+
+        // Try multiple possible transcript endpoints
+        const possibleEndpoints = [
+            `${ULTRAVOX_API_URL}/${callId}/transcript`,
+            `${ULTRAVOX_API_URL}/${callId}/messages`,
+            `https://api.ultravox.ai/api/calls/${callId}/transcript`,
+            `https://api.ultravox.ai/api/calls/${callId}/messages`
+        ];
+
+        let attemptCount = 0;
+
+        function tryNextEndpoint() {
+            if (attemptCount >= possibleEndpoints.length) {
+                reject(new Error('No transcript found at any endpoint'));
+                return;
+            }
+
+            const apiUrl = possibleEndpoints[attemptCount];
+            console.log(`Attempting to fetch transcript from: ${apiUrl}`);
+            attemptCount++;
+
+            const request = https.request(apiUrl, {
+                method: 'GET',
+                headers: {
+                    'Content-Type': 'application/json',
+                    'X-API-Key': ULTRAVOX_API_KEY
+                },
+                timeout: 10000
+            });
+
+            let data = '';
+
+            request.on('response', (response) => {
+                console.log(`Transcript endpoint ${apiUrl} response status: ${response.statusCode}`);
+                
+                response.on('data', chunk => data += chunk);
+                response.on('end', () => {
+                    try {
+                        if (response.statusCode === 404 || response.statusCode === 400) {
+                            // Try next endpoint
+                            tryNextEndpoint();
+                            return;
+                        }
+                        
+                        if (response.statusCode >= 400) {
+                            tryNextEndpoint();
+                            return;
+                        }
+
+                        const parsed = JSON.parse(data || '{}');
+                        console.log(`Transcript data received: ${JSON.stringify(parsed, null, 2)}`);
+                        resolve(parsed);
+                    } catch (e) {
+                        console.error('Failed parsing transcript response:', e, data);
+                        tryNextEndpoint();
+                    }
+                });
+            });
+
+            request.on('error', (error) => {
+                console.error(`Transcript request error for ${apiUrl}:`, error);
+                tryNextEndpoint();
+            });
+
+            request.on('timeout', () => {
+                console.error(`Transcript request timeout for ${apiUrl}`);
+                request.destroy();
+                tryNextEndpoint();
+            });
+
+            request.end();
+        }
+
+        tryNextEndpoint();
     });
 }
 
@@ -712,15 +950,6 @@ app.post('/ultravox/events', async (req, res) => {
             // Process final transcript and perform analysis when call ends
             console.log('📞 Call ended - processing final transcript');
             
-            // Extract transcript from various possible locations in the event
-            const transcript = event.transcript || 
-                             event.data?.transcript || 
-                             event.messages?.map(m => m.text).join(' ') || 
-                             event.conversation || 
-                             '';
-                             
-            const summary = event.summary || event.data?.summary || '';
-            
             if (!callId) {
                 console.log('⚠️ No call ID in end call event, acknowledging...');
                 return res.json({ ok: true, message: 'No call ID provided' });
@@ -728,15 +957,58 @@ app.post('/ultravox/events', async (req, res) => {
 
             const existing = await getConversationById(callId);
             
+            // Extract transcript from various possible locations in the event
+            let transcript = event.transcript || 
+                           event.data?.transcript || 
+                           event.messages?.map(m => m.text).join(' ') || 
+                           event.conversation || 
+                           '';
+                           
+            const summary = event.summary || event.data?.summary || '';
+            
+            // If no transcript in event, try to fetch from Ultravox API
+            if (!transcript) {
+                console.log('📥 No transcript in event, fetching from Ultravox API...');
+                try {
+                    // Try to get call details first
+                    const callDetails = await getUltravoxCallDetails(callId);
+                    console.log('Call details received:', JSON.stringify(callDetails, null, 2));
+                    
+                    // Extract transcript from call details
+                    transcript = callDetails.transcript || 
+                               callDetails.messages?.map(m => m.text || m.content).join(' ') || 
+                               callDetails.conversation || '';
+                    
+                    // If still no transcript, try dedicated transcript endpoint
+                    if (!transcript) {
+                        console.log('📥 Trying dedicated transcript endpoint...');
+                        const transcriptData = await getUltravoxTranscript(callId);
+                        
+                        if (Array.isArray(transcriptData)) {
+                            transcript = transcriptData.map(msg => msg.text || msg.content || msg.message).filter(Boolean).join(' ');
+                        } else if (transcriptData.transcript) {
+                            transcript = transcriptData.transcript;
+                        } else if (transcriptData.messages) {
+                            transcript = transcriptData.messages.map(m => m.text || m.content).join(' ');
+                        }
+                    }
+                } catch (transcriptError) {
+                    console.warn('Failed to fetch transcript from API:', transcriptError.message);
+                    console.log('📝 Will analyze available data without full transcript');
+                }
+            }
+            
+            // If still no meaningful transcript, create a basic analysis from available data
+            if (!transcript || transcript.trim().length === 0) {
+                console.log('⚠️ No transcript available - creating analysis from call metadata');
+                transcript = `Call from ${from || 'unknown number'} - Duration and transcript not available`;
+            }
+            
+            console.log(`📋 Final transcript length: ${transcript.length} characters`);
+            console.log(`📋 Transcript preview: ${transcript.substring(0, 200)}...`);
+            
             // Perform mental health analysis on the final transcript
-            const analysis = transcript ? await classifyRiskAndCounselling(transcript) : {
-                tendency: 'no',
-                needsCounselling: 'no',
-                review: 'No transcript available for analysis',
-                score: 0,
-                detectedTerms: [],
-                immediateIntervention: false
-            };
+            const analysis = await classifyRiskAndCounselling(transcript);
             
             const record = {
                 id: callId,
@@ -792,6 +1064,156 @@ app.get('/api/conversations', async (_req, res) => {
     }
 });
 
+// Manual endpoint to refresh transcript and analysis for a specific conversation
+app.post('/api/conversations/:id/refresh', async (req, res) => {
+    try {
+        const callId = req.params.id;
+        console.log(`🔄 Manual refresh requested for conversation: ${callId}`);
+        
+        const existing = await getConversationById(callId);
+        if (!existing) {
+            return res.status(404).json({ ok: false, error: 'Conversation not found' });
+        }
+        
+        let transcript = existing.transcript || '';
+        let updated = false;
+        
+        // Try to fetch transcript from Ultravox API if missing or empty
+        if (!transcript || transcript.trim().length === 0) {
+            console.log('📥 Fetching transcript from Ultravox API...');
+            try {
+                // Try to get call details
+                const callDetails = await getUltravoxCallDetails(callId);
+                console.log('Call details received for refresh:', JSON.stringify(callDetails, null, 2));
+                
+                // Extract transcript from call details
+                transcript = callDetails.transcript || 
+                           callDetails.messages?.map(m => m.text || m.content).join(' ') || 
+                           callDetails.conversation || '';
+                
+                // If still no transcript, try dedicated transcript endpoint
+                if (!transcript) {
+                    console.log('📥 Trying dedicated transcript endpoint...');
+                    const transcriptData = await getUltravoxTranscript(callId);
+                    
+                    if (Array.isArray(transcriptData)) {
+                        transcript = transcriptData.map(msg => msg.text || msg.content || msg.message).filter(Boolean).join(' ');
+                    } else if (transcriptData.transcript) {
+                        transcript = transcriptData.transcript;
+                    } else if (transcriptData.messages) {
+                        transcript = transcriptData.messages.map(m => m.text || m.content).join(' ');
+                    }
+                }
+                
+                if (transcript && transcript.trim().length > 0) {
+                    updated = true;
+                    console.log(`📋 New transcript retrieved: ${transcript.length} characters`);
+                }
+            } catch (transcriptError) {
+                console.warn('Failed to fetch transcript from API during refresh:', transcriptError.message);
+            }
+        }
+        
+        // Re-analyze with current or newly fetched transcript
+        const analysis = await classifyRiskAndCounselling(transcript || 'No transcript available');
+        
+        const updatedRecord = {
+            ...existing,
+            updatedAt: new Date().toISOString(),
+            transcript: transcript || existing.transcript || '',
+            summary: analysis.review,
+            tendency: analysis.tendency,
+            needsCounselling: analysis.needsCounselling,
+            score: analysis.score,
+            detectedTerms: analysis.detectedTerms,
+            immediateIntervention: analysis.immediateIntervention,
+            geminiAnalysis: analysis.geminiAnalysis,
+            status: transcript ? 'completed' : 'no_transcript'
+        };
+        
+        await upsertConversation(updatedRecord);
+        
+        console.log(`✅ Conversation refresh complete - Risk: ${analysis.tendency}, Score: ${analysis.score}, Updated: ${updated}`);
+        res.json({ 
+            ok: true, 
+            conversation: updatedRecord, 
+            riskAnalysis: analysis,
+            transcriptUpdated: updated,
+            message: updated ? 'Transcript fetched and analysis updated' : 'Analysis updated with existing data'
+        });
+        
+    } catch (error) {
+        console.error('Error refreshing conversation:', error);
+        res.status(500).json({ ok: false, error: 'Internal server error' });
+    }
+});
+
+// Batch refresh endpoint to update all conversations missing transcripts
+app.post('/api/conversations/refresh-all', async (req, res) => {
+    try {
+        console.log('🔄 Batch refresh requested for all conversations');
+        
+        const conversations = await getConversations();
+        const results = [];
+        
+        for (const conv of conversations) {
+            if (!conv.transcript || conv.transcript.trim().length === 0) {
+                console.log(`🔄 Refreshing conversation ${conv.id}...`);
+                
+                try {
+                    // Fetch transcript
+                    let transcript = '';
+                    const callDetails = await getUltravoxCallDetails(conv.id);
+                    transcript = callDetails.transcript || 
+                               callDetails.messages?.map(m => m.text || m.content).join(' ') || 
+                               callDetails.conversation || '';
+                    
+                    if (!transcript) {
+                        const transcriptData = await getUltravoxTranscript(conv.id);
+                        if (Array.isArray(transcriptData)) {
+                            transcript = transcriptData.map(msg => msg.text || msg.content || msg.message).filter(Boolean).join(' ');
+                        } else if (transcriptData.transcript) {
+                            transcript = transcriptData.transcript;
+                        }
+                    }
+                    
+                    // Re-analyze
+                    const analysis = await classifyRiskAndCounselling(transcript || 'No transcript available');
+                    
+                    const updatedRecord = {
+                        ...conv,
+                        updatedAt: new Date().toISOString(),
+                        transcript: transcript || conv.transcript || '',
+                        summary: analysis.review,
+                        tendency: analysis.tendency,
+                        needsCounselling: analysis.needsCounselling,
+                        score: analysis.score,
+                        detectedTerms: analysis.detectedTerms,
+                        immediateIntervention: analysis.immediateIntervention,
+                        geminiAnalysis: analysis.geminiAnalysis
+                    };
+                    
+                    await upsertConversation(updatedRecord);
+                    results.push({ id: conv.id, status: 'updated', transcriptLength: transcript.length });
+                    
+                } catch (error) {
+                    console.error(`Failed to refresh conversation ${conv.id}:`, error);
+                    results.push({ id: conv.id, status: 'failed', error: error.message });
+                }
+            } else {
+                results.push({ id: conv.id, status: 'skipped', reason: 'already has transcript' });
+            }
+        }
+        
+        console.log(`✅ Batch refresh complete - processed ${results.length} conversations`);
+        res.json({ ok: true, results, message: `Processed ${results.length} conversations` });
+        
+    } catch (error) {
+        console.error('Error in batch refresh:', error);
+        res.status(500).json({ ok: false, error: 'Internal server error' });
+    }
+});
+
 // Health check endpoint
 app.get('/health', (req, res) => {
     res.json({ 
@@ -811,23 +1233,36 @@ app.get('/dashboard', async (_req, res) => {
     try {
         const convs = await getConversations();
 
-        const rows = convs.map(c => `
+        const rows = convs.map(c => {
+            const hasTranscript = c.transcript && c.transcript.trim().length > 0;
+            const transcriptStatus = hasTranscript ? 
+                `${c.transcript.length} chars` : 
+                '<span style="color:#dc2626;">No transcript</span>';
+                
+            return `
             <tr ${c.immediateIntervention ? 'style="background-color:#fef2f2;border-left:4px solid #dc2626;"' : ''}>
-                <td style="font-family:sans-serif;padding:8px;">${c.id}</td>
+                <td style="font-family:sans-serif;padding:8px;font-size:12px;">${c.id.substring(0, 8)}...</td>
                 <td style="font-family:sans-serif;padding:8px;">${c.from}</td>
-                <td style="font-family:sans-serif;padding:8px;">${new Date(c.createdAt).toLocaleString()}</td>
-                <td style="font-family:sans-serif;padding:8px;">${new Date(c.updatedAt).toLocaleString()}</td>
+                <td style="font-family:sans-serif;padding:8px;font-size:12px;">${new Date(c.createdAt).toLocaleString()}</td>
+                <td style="font-family:sans-serif;padding:8px;font-size:12px;">${new Date(c.updatedAt).toLocaleString()}</td>
                 <td style="font-family:sans-serif;padding:8px;">${badge(c.status || 'unknown')}</td>
+                <td style="font-family:sans-serif;padding:8px;">${transcriptStatus}</td>
                 <td style="font-family:sans-serif;padding:8px;">${badge(c.tendency)}</td>
                 <td style="font-family:sans-serif;padding:8px;">${badge(c.needsCounselling)}</td>
                 <td style="font-family:sans-serif;padding:8px;text-align:center;">${c.score || 0}</td>
                 <td style="font-family:sans-serif;padding:8px;text-align:center;">${c.immediateIntervention ? '🚨' : '-'}</td>
-                <td style="font-family:sans-serif;padding:8px;"><a href="/conversations/${encodeURIComponent(c.id)}">View</a></td>
+                <td style="font-family:sans-serif;padding:8px;text-align:center;">${c.geminiAnalysis ? '✅' : '❌'}</td>
+                <td style="font-family:sans-serif;padding:8px;">
+                    <a href="/conversations/${encodeURIComponent(c.id)}">View</a> | 
+                    <button onclick="refreshConversation('${c.id}')" style="font-size:12px;padding:2px 6px;">Refresh</button>
+                </td>
             </tr>
-        `).join('');
+        `}).join('');
 
         const emergencyCount = convs.filter(c => c.immediateIntervention || c.tendency === 'severe').length;
         const highRiskCount = convs.filter(c => c.tendency === 'high').length;
+        const missingTranscripts = convs.filter(c => !c.transcript || c.transcript.trim().length === 0).length;
+        const withGeminiAnalysis = convs.filter(c => c.geminiAnalysis).length;
 
         const html = `<!doctype html>
         <html>
@@ -847,16 +1282,32 @@ app.get('/dashboard', async (_req, res) => {
                 .active{background:#3b82f6}
                 .completed{background:#10b981}
                 .unknown{background:#6b7280}
-                .stats{display:flex;gap:20px;margin:20px 0;}
+                .no_transcript{background:#7c2d12}
+                .stats{display:flex;gap:20px;margin:20px 0;flex-wrap:wrap;}
                 .stat-card{background:#f8f9fa;padding:15px;border-radius:8px;text-align:center;min-width:120px;}
                 .stat-number{font-size:24px;font-weight:bold;color:#333;}
                 .stat-label{font-size:14px;color:#666;}
                 .emergency{background:#fee2e2;border-left:4px solid #dc2626;}
+                .actions{margin:20px 0;padding:15px;background:#f0f9ff;border-radius:8px;}
+                .btn{padding:8px 16px;margin:5px;border:none;border-radius:4px;cursor:pointer;font-size:14px;}
+                .btn-primary{background:#3b82f6;color:white;}
+                .btn-secondary{background:#6b7280;color:white;}
+                .loading{display:none;color:#3b82f6;}
+                table{width:100%;margin-top:20px;}
+                th{background:#f1f5f9;padding:8px;text-align:left;font-size:13px;}
+                td{border-bottom:1px solid #e5e7eb;}
             </style>
         </head>
         <body style="margin:24px;font-family:sans-serif;">
             <h2>🧠 Mental Health Monitoring Dashboard</h2>
             <p><a href="/health">Health Check</a> | <a href="/api/conversations">API</a></p>
+            
+            <div class="actions">
+                <button class="btn btn-primary" onclick="refreshAllConversations()">🔄 Refresh All Missing Transcripts</button>
+                <button class="btn btn-secondary" onclick="location.reload()">🔃 Reload Dashboard</button>
+                <span class="loading" id="loading">⏳ Processing...</span>
+                <div id="result" style="margin-top:10px;"></div>
+            </div>
             
             <div class="stats">
                 <div class="stat-card">
@@ -871,20 +1322,30 @@ app.get('/dashboard', async (_req, res) => {
                     <div class="stat-number">${highRiskCount}</div>
                     <div class="stat-label">⚠️ High Risk</div>
                 </div>
+                <div class="stat-card" style="background:#fee2e2;">
+                    <div class="stat-number">${missingTranscripts}</div>
+                    <div class="stat-label">📝 No Transcript</div>
+                </div>
+                <div class="stat-card" style="background:#dcfce7;">
+                    <div class="stat-number">${withGeminiAnalysis}</div>
+                    <div class="stat-label">🤖 AI Analyzed</div>
+                </div>
             </div>
             
-            <table border="1" cellspacing="0" cellpadding="0" style="border-collapse:collapse;min-width:1200px;margin-top:20px;">
-                <thead style="background:#f1f5f9;">
+            <table border="1" cellspacing="0" cellpadding="0" style="border-collapse:collapse;min-width:1400px;">
+                <thead>
                     <tr>
                         <th style="padding:8px;text-align:left;">Call ID</th>
                         <th style="padding:8px;text-align:left;">Phone</th>
                         <th style="padding:8px;text-align:left;">Started</th>
                         <th style="padding:8px;text-align:left;">Updated</th>
                         <th style="padding:8px;text-align:left;">Status</th>
+                        <th style="padding:8px;text-align:left;">Transcript</th>
                         <th style="padding:8px;text-align:left;">Risk Level</th>
                         <th style="padding:8px;text-align:left;">Counselling</th>
                         <th style="padding:8px;text-align:left;">Score</th>
                         <th style="padding:8px;text-align:left;">Alert</th>
+                        <th style="padding:8px;text-align:left;">AI</th>
                         <th style="padding:8px;text-align:left;">Actions</th>
                     </tr>
                 </thead>
@@ -897,8 +1358,56 @@ app.get('/dashboard', async (_req, res) => {
                 <h4>Legend:</h4>
                 <p><strong>Risk Levels:</strong> ${badge('no')} No Risk | ${badge('low')} Low | ${badge('medium')} Medium | ${badge('high')} High | ${badge('severe')} Severe</p>
                 <p><strong>Counselling:</strong> ${badge('no')} Not Needed | ${badge('advised')} Recommended | ${badge('yes')} Urgent</p>
-                <p><strong>🚨 Alert:</strong> Indicates immediate intervention may be needed</p>
+                <p><strong>🚨 Alert:</strong> Immediate intervention may be needed | <strong>🤖 AI:</strong> Gemini analysis available</p>
             </div>
+            
+            <script>
+                async function refreshConversation(id) {
+                    try {
+                        document.getElementById('loading').style.display = 'inline';
+                        const response = await fetch(\`/api/conversations/\${id}/refresh\`, { 
+                            method: 'POST',
+                            headers: { 'Content-Type': 'application/json' }
+                        });
+                        const result = await response.json();
+                        document.getElementById('loading').style.display = 'none';
+                        
+                        if (result.ok) {
+                            document.getElementById('result').innerHTML = \`<div style="color:green;">✅ \${result.message}</div>\`;
+                            setTimeout(() => location.reload(), 2000);
+                        } else {
+                            document.getElementById('result').innerHTML = \`<div style="color:red;">❌ \${result.error}</div>\`;
+                        }
+                    } catch (error) {
+                        document.getElementById('loading').style.display = 'none';
+                        document.getElementById('result').innerHTML = \`<div style="color:red;">❌ Error: \${error.message}</div>\`;
+                    }
+                }
+                
+                async function refreshAllConversations() {
+                    try {
+                        document.getElementById('loading').style.display = 'inline';
+                        const response = await fetch('/api/conversations/refresh-all', { 
+                            method: 'POST',
+                            headers: { 'Content-Type': 'application/json' }
+                        });
+                        const result = await response.json();
+                        document.getElementById('loading').style.display = 'none';
+                        
+                        if (result.ok) {
+                            const updated = result.results.filter(r => r.status === 'updated').length;
+                            const failed = result.results.filter(r => r.status === 'failed').length;
+                            document.getElementById('result').innerHTML = \`<div style="color:green;">✅ Processed \${result.results.length} conversations: \${updated} updated, \${failed} failed</div>\`;
+                            setTimeout(() => location.reload(), 3000);
+                        } else {
+                            document.getElementById('result').innerHTML = \`<div style="color:red;">❌ \${result.error}</div>\`;
+                        }
+                    } catch (error) {
+                        document.getElementById('loading').style.display = 'none';
+                        document.getElementById('result').innerHTML = \`<div style="color:red;">❌ Error: \${error.message}</div>\`;
+                    }
+                }
+            </script>
         </body>
         </html>`;
 
@@ -915,6 +1424,32 @@ app.get('/conversations/:id', (req, res) => {
     getConversationById(id).then(c => {
         if (!c) return res.status(404).send('Not found');
 
+        const geminiSection = c.geminiAnalysis ? `
+        <h3>🤖 AI Analysis (Gemini)</h3>
+        <div style="background:#f0fdf4;padding:15px;border-radius:8px;margin:10px 0;">
+            <p><strong>Risk Level:</strong> <span class="badge ${c.geminiAnalysis.risk_level}">${c.geminiAnalysis.risk_level}</span></p>
+            <p><strong>Counseling Needed:</strong> <span class="badge ${c.geminiAnalysis.counseling_needed}">${c.geminiAnalysis.counseling_needed}</span></p>
+            ${c.geminiAnalysis.emotional_state ? `<p><strong>Emotional State:</strong> ${c.geminiAnalysis.emotional_state}</p>` : ''}
+            ${c.geminiAnalysis.language_used ? `<p><strong>Language Used:</strong> ${c.geminiAnalysis.language_used}</p>` : ''}
+            ${c.geminiAnalysis.immediate_intervention ? `<p><strong>Immediate Intervention:</strong> <span style="color:red;font-weight:bold;">${c.geminiAnalysis.immediate_intervention}</span></p>` : ''}
+            ${c.geminiAnalysis.assessment_summary ? `<p><strong>Assessment:</strong> ${c.geminiAnalysis.assessment_summary}</p>` : ''}
+            ${c.geminiAnalysis.concerning_phrases && c.geminiAnalysis.concerning_phrases.length > 0 ? `
+                <p><strong>Concerning Phrases:</strong> ${c.geminiAnalysis.concerning_phrases.map(p => `<span style="background:#fee2e2;padding:2px 6px;border-radius:4px;margin:2px;">${p}</span>`).join(' ')}</p>
+            ` : ''}
+            ${c.geminiAnalysis.support_recommendations ? `<p><strong>Support Recommendations:</strong> ${c.geminiAnalysis.support_recommendations}</p>` : ''}
+            ${c.geminiAnalysis.confidence_level ? `<p><strong>Confidence Level:</strong> ${c.geminiAnalysis.confidence_level}</p>` : ''}
+        </div>` : '<h3>🤖 AI Analysis</h3><p style="color:#6b7280;">No AI analysis available</p>';
+
+        const detectedTermsSection = c.detectedTerms && c.detectedTerms.length > 0 ? `
+        <h3>🔍 Detected Terms</h3>
+        <div style="margin:10px 0;">
+            ${c.detectedTerms.map(term => `
+                <span style="background:#${term.category === 'severe' ? 'fee2e2' : term.category === 'high' ? 'fef3c7' : term.category === 'medium' ? 'ddd6fe' : 'e5e7eb'};padding:4px 8px;border-radius:6px;margin:3px;display:inline-block;font-size:12px;">
+                    ${term.term} <em>(${term.category})</em>
+                </span>
+            `).join('')}
+        </div>` : '';
+
     const html = `<!doctype html>
     <html>
     <head>
@@ -930,22 +1465,81 @@ app.get('/conversations/:id', (req, res) => {
             .severe{background:#7f1d1d}
             .yes{background:#ef4444}
             .advised{background:#f59e0b}
+            .btn{padding:8px 16px;margin:5px;border:none;border-radius:4px;cursor:pointer;font-size:14px;text-decoration:none;display:inline-block;}
+            .btn-primary{background:#3b82f6;color:white;}
         </style>
     </head>
     <body style="margin:24px;font-family:sans-serif;">
-        <a href="/dashboard">← Back</a>
-        <h2>Conversation ${id}</h2>
-        <p><strong>From:</strong> ${c.from}</p>
-        <p><strong>Created:</strong> ${new Date(c.createdAt).toLocaleString()}</p>
-        <p><strong>Updated:</strong> ${new Date(c.updatedAt).toLocaleString()}</p>
-        <p><strong>Tendency:</strong> <span class="badge ${c.tendency}">${c.tendency}</span></p>
-        <p><strong>Counselling:</strong> <span class="badge ${c.needsCounselling}">${c.needsCounselling}</span></p>
-        <h3>AI Review</h3>
-        <p>${(c.summary || '').replace(/</g, '&lt;')}</p>
-        <h3>Transcript</h3>
-        <pre style="white-space:pre-wrap;">${(c.transcript || '').replace(/</g, '&lt;')}</pre>
-        <h3>Raw Data</h3>
-        <pre style="white-space:pre-wrap;font-size:12px;">${JSON.stringify(c.raw || {}, null, 2).replace(/</g, '&lt;')}</pre>
+        <div style="margin-bottom:20px;">
+            <a href="/dashboard">← Back to Dashboard</a>
+            <button class="btn btn-primary" onclick="refreshConversation()" style="float:right;">🔄 Refresh Analysis</button>
+        </div>
+        
+        <h2>Conversation Details</h2>
+        
+        <div style="background:#f8f9fa;padding:20px;border-radius:8px;margin:20px 0;">
+            <h3>📋 Basic Information</h3>
+            <p><strong>Call ID:</strong> ${c.id}</p>
+            <p><strong>From:</strong> ${c.from}</p>
+            <p><strong>Created:</strong> ${new Date(c.createdAt).toLocaleString()}</p>
+            <p><strong>Updated:</strong> ${new Date(c.updatedAt).toLocaleString()}</p>
+            <p><strong>Status:</strong> <span class="badge ${c.status || 'unknown'}">${c.status || 'unknown'}</span></p>
+        </div>
+        
+        <div style="background:#f0f9ff;padding:20px;border-radius:8px;margin:20px 0;">
+            <h3>🎯 Risk Assessment</h3>
+            <p><strong>Risk Level:</strong> <span class="badge ${c.tendency}">${c.tendency}</span></p>
+            <p><strong>Counselling Needed:</strong> <span class="badge ${c.needsCounselling}">${c.needsCounselling}</span></p>
+            <p><strong>Risk Score:</strong> ${c.score || 0}</p>
+            <p><strong>Immediate Intervention:</strong> ${c.immediateIntervention ? '🚨 <span style="color:red;font-weight:bold;">YES</span>' : 'No'}</p>
+        </div>
+        
+        ${geminiSection}
+        
+        ${detectedTermsSection}
+        
+        <h3>📋 System Review</h3>
+        <div style="background:#fffbeb;padding:15px;border-radius:8px;border-left:4px solid #f59e0b;">
+            <p>${(c.summary || 'No system review available').replace(/</g, '&lt;')}</p>
+        </div>
+        
+        <h3>📝 Transcript</h3>
+        <div style="background:#f9fafb;padding:15px;border-radius:8px;border:1px solid #e5e7eb;">
+            ${c.transcript && c.transcript.trim() ? 
+                `<pre style="white-space:pre-wrap;margin:0;">${c.transcript.replace(/</g, '&lt;')}</pre>` :
+                '<p style="color:#6b7280;font-style:italic;">No transcript available</p>'
+            }
+        </div>
+        
+        <h3>🔧 Raw Data</h3>
+        <details style="margin:20px 0;">
+            <summary style="cursor:pointer;padding:10px;background:#f3f4f6;border-radius:4px;">Show Raw Data</summary>
+            <pre style="white-space:pre-wrap;font-size:12px;background:#f9fafb;padding:15px;border-radius:8px;margin-top:10px;overflow:auto;">${JSON.stringify(c.raw || {}, null, 2).replace(/</g, '&lt;')}</pre>
+        </details>
+        
+        <div id="result" style="margin-top:20px;"></div>
+        
+        <script>
+            async function refreshConversation() {
+                try {
+                    document.getElementById('result').innerHTML = '<div style="color:#3b82f6;">⏳ Refreshing analysis...</div>';
+                    const response = await fetch(\`/api/conversations/${encodeURIComponent(c.id)}/refresh\`, { 
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' }
+                    });
+                    const result = await response.json();
+                    
+                    if (result.ok) {
+                        document.getElementById('result').innerHTML = \`<div style="color:green;padding:10px;background:#f0fdf4;border-radius:4px;">✅ \${result.message}</div>\`;
+                        setTimeout(() => location.reload(), 2000);
+                    } else {
+                        document.getElementById('result').innerHTML = \`<div style="color:red;padding:10px;background:#fef2f2;border-radius:4px;">❌ \${result.error}</div>\`;
+                    }
+                } catch (error) {
+                    document.getElementById('result').innerHTML = \`<div style="color:red;padding:10px;background:#fef2f2;border-radius:4px;">❌ Error: \${error.message}</div>\`;
+                }
+            }
+        </script>
     </body>
     </html>`;
         res.type('html').send(html);
