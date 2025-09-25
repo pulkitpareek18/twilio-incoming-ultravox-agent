@@ -164,12 +164,13 @@ function badge(label) {
     return `<span class="badge ${cls}">${safe || 'unknown'}</span>`;
 }
 
-// Risk Classification logic (Unchanged)
+// Enhanced Risk Classification with Gemini
 async function classifyRiskAndCounselling(transcriptText) {
-    // ... This entire long function remains the same as before ...
     const text = (transcriptText || '').toLowerCase();
     let score = 0;
     let detectedTerms = [];
+    
+    // --- Keyword detection logic remains the same ---
     const criticalSevereTerms = ['suicide', 'kill myself', 'end my life', 'i want to die', 'hang myself', 'take my own life', 'marna chahta hun', 'jaan dena', 'suicide karna'];
     const severePlanTerms = ['jump off', 'overdose', 'self harm', 'self-harm', 'cut myself', 'razor blade', 'poison myself', 'gun to my head', 'bought a rope', 'bought pills', 'wrote a note'];
     const highTerms = ['i am going to', 'i have a plan', 'goodbye forever', 'can\'t go on', 'hopeless', 'life is meaningless', 'nothing matters', 'give up completely', 'no way out', 'trapped forever', 'can\'t escape', 'ready to go', 'final decision', 'said goodbye', 'planning to end', 'going to jump', 'no reason to live', 'better off dead', 'koi raah nahi', 'umeed khatam', 'plan bana liya', 'alvida keh diya', 'bass khatam', 'zindagi khatam'];
@@ -182,14 +183,61 @@ async function classifyRiskAndCounselling(transcriptText) {
     lowTerms.forEach(term => { if (text.includes(term)) { score += 1; detectedTerms.push({ term, category: 'low' }); } });
     const immediateRiskPatterns = [/i\s+(am|will|going to)\s+(kill|end|hurt|harm)\s+(my)/i, /tonight\s+(i|will|going)/i, /(plan|planning)\s+to\s+(die|kill|end)/i, /(ready|prepared)\s+to\s+(die|go|leave)/i, /going\s+to\s+(jump|hang)/i];
     immediateRiskPatterns.forEach(pattern => { if (pattern.test(text)) { score += 10; detectedTerms.push({ term: 'immediate_risk_pattern', category: 'critical_severe' }); } });
+    
     let tendency = 'no';
     if (score >= 10) tendency = 'severe'; else if (score >= 6) tendency = 'high'; else if (score >= 4) tendency = 'medium'; else if (score >= 1) tendency = 'low';
+    
     let needsCounselling = 'no';
     if (tendency === 'severe' || tendency === 'high') needsCounselling = 'yes'; else if (tendency === 'medium') needsCounselling = 'advised';
+
     let geminiAnalysis = null;
-    if (gemini && transcriptText && transcriptText.trim().length > 0) { try { /* Gemini Logic */ } catch (e) { console.warn('Gemini classification failed:', e); } }
+    // --- ✅ Gemini Analysis Logic ---
+    if (gemini && transcriptText && transcriptText.trim().length > 50) { // Only run for reasonably long transcripts
+        try {
+            console.log('🤖 Starting Gemini analysis...');
+            const model = gemini.getGenerativeModel({ model: GEMINI_MODEL });
+            const prompt = `
+                Analyze the following conversation transcript for mental health risks. The user is talking to a supportive friend AI named Arjun.
+                The conversation is primarily in Hindi.
+                Provide your analysis ONLY in a valid JSON format. Do not include any text before or after the JSON object.
+                
+                The JSON object must have these exact keys:
+                - "risk_level": (string) Classify the risk as "no", "low", "medium", "high", or "severe".
+                - "counseling_needed": (string) Recommend counseling as "no", "advised", or "yes".
+                - "immediate_intervention": (string) State "yes" if there are signs of immediate self-harm plans, otherwise "no".
+                - "emotional_state": (string) A brief description of the user's likely emotional state (e.g., "Stressed and overwhelmed", "Feeling lonely and sad", "Exhibiting signs of severe depression").
+                - "concerning_phrases": (array of strings) Extract up to 5 direct quotes from the user that are most concerning.
+                - "assessment_summary": (string) A concise one-paragraph summary of your analysis and the reasoning for the risk level.
+                - "confidence_level": (string) Your confidence in this analysis ("low", "medium", "high").
+                - "language_used": (string) The primary language detected ("hindi", "english", "hinglish").
+                - "support_recommendations": (string) Suggest one brief, actionable step for the support agent (e.g., "Advise professional help", "Continue to listen and provide support", "Gently probe about their support system").
+                
+                Transcript:
+                ---
+                ${transcriptText}
+                ---
+            `;
+            const result = await model.generateContent(prompt);
+            const responseText = result.response.text().trim().replace(/^```json\n?/, '').replace(/\n?```$/, '');
+            geminiAnalysis = JSON.parse(responseText);
+            console.log('✅ Gemini analysis successful.');
+        } catch (e) {
+            console.warn('Gemini classification failed:', e);
+            geminiAnalysis = { error: e.message };
+        }
+    }
+    
     const review = (() => { if (tendency === 'severe') return `🚨 SEVERE RISK DETECTED...`; if (tendency === 'high') return `⚠️ HIGH RISK...`; if (tendency === 'medium') return `⚡ MODERATE CONCERN...`; if (tendency === 'low') return `💭 MILD DISTRESS...`; return 'No significant risk indicators detected.'; })();
-    return { tendency, needsCounselling, review, score, detectedTerms, geminiAnalysis, immediateIntervention: tendency === 'severe' || detectedTerms.some(t => t.category === 'critical_severe') || (geminiAnalysis?.immediate_intervention === 'yes') };
+    
+    return {
+        tendency,
+        needsCounselling,
+        review,
+        score,
+        detectedTerms,
+        geminiAnalysis,
+        immediateIntervention: tendency === 'severe' || detectedTerms.some(t => t.category === 'critical_severe') || (geminiAnalysis?.immediate_intervention === 'yes')
+    };
 }
 
 // --- Corrected Ultravox API Functions ---
@@ -372,8 +420,6 @@ app.post('/ultravox/events', async (req, res) => {
     console.log('Received Webhook Event:', JSON.stringify(req.body, null, 2));
     const event = req.body || {};
 
-    // ✅ FIX #2: Parse callId correctly from nested 'call' object in webhook payload.
-    // Also, handle both Ultravox webhook format and Twilio Status Callback format.
     const callId = event.call?.callId || req.body.ParentCallSid || req.body.CallSid;
     const eventType = event.event || req.body.CallStatus; // 'call.ended' or 'completed'
 
@@ -389,8 +435,7 @@ app.post('/ultravox/events', async (req, res) => {
     if (eventType === 'completed' || eventType === 'call.ended') {
         console.log(`📞 Call ended for ${callId} - processing transcript and recording.`);
         try {
-            // Important: We need the Ultravox Call ID, which we stored earlier.
-            // Twilio's CallSid is different. We need to look up our record by Twilio's SID.
+            // We need to look up our record by Twilio's SID to get the Ultravox Call ID.
             const existing = await findConversationByTwilioSid(callId);
             if (!existing) {
                 console.error(`Could not find a record for Twilio CallSid: ${callId}`);
@@ -403,8 +448,7 @@ app.post('/ultravox/events', async (req, res) => {
                 getUltravoxTranscriptFromMessages(ultravoxCallId),
                 getUltravoxCall(ultravoxCallId),
             ]);
-            // Handle results
-
+            
             const transcript = transcriptResult.status === 'fulfilled' ? transcriptResult.value : '';
             const callDetails = callDetailsResult.status === 'fulfilled' ? callDetailsResult.value : null;
 
@@ -448,7 +492,7 @@ app.get('/api/conversations', async (_req, res) => {
     }
 });
 
-// Manual endpoint to refresh a specific conversation
+// Manual endpoint to refresh a specific conversation's transcript and recording
 app.post('/api/conversations/:id/refresh', async (req, res) => {
     try {
         const { id: callId } = req.params;
@@ -491,6 +535,50 @@ app.post('/api/conversations/:id/refresh', async (req, res) => {
     } catch (error) {
         console.error('Error refreshing conversation:', error);
         res.status(500).json({ ok: false, error: 'Internal server error' });
+    }
+});
+
+// Endpoint to regenerate AI analysis for a specific conversation
+app.post('/api/conversations/:id/regenerate-analysis', async (req, res) => {
+    try {
+        const { id: callId } = req.params;
+        console.log(`🤖 Regenerating AI analysis for conversation: ${callId}`);
+        const existing = await getConversationById(callId);
+
+        if (!existing) {
+            return res.status(404).json({ ok: false, error: 'Conversation not found' });
+        }
+
+        if (!existing.transcript || existing.transcript.trim().length === 0) {
+            return res.status(400).json({ ok: false, error: 'Cannot regenerate analysis without a transcript.' });
+        }
+
+        // Re-run the full analysis, which includes the Gemini call
+        const analysis = await classifyRiskAndCounselling(existing.transcript);
+
+        const updatedRecord = {
+            ...existing,
+            updatedAt: new Date().toISOString(),
+            summary: analysis.review,
+            tendency: analysis.tendency,
+            needsCounselling: analysis.needsCounselling,
+            score: analysis.score,
+            detectedTerms: analysis.detectedTerms,
+            immediateIntervention: analysis.immediateIntervention,
+            geminiAnalysis: analysis.geminiAnalysis,
+        };
+        
+        await upsertConversation(updatedRecord);
+        
+        console.log(`✅ AI Analysis regeneration complete for ${callId}`);
+        res.json({ 
+            ok: true, 
+            conversation: updatedRecord, 
+            message: 'AI analysis has been successfully regenerated.' 
+        });
+    } catch (error) {
+        console.error('Error regenerating AI analysis:', error);
+        res.status(500).json({ ok: false, error: 'Internal server error during analysis regeneration.' });
     }
 });
 
@@ -546,7 +634,6 @@ app.post('/api/conversations/refresh-all', async (req, res) => {
         res.status(500).json({ ok: false, error: 'Internal server error' });
     }
 });
-
 
 // Import actual calls from Ultravox endpoint
 app.post('/api/conversations/import-from-ultravox', async (req, res) => {
@@ -962,12 +1049,16 @@ app.get('/conversations/:id', (req, res) => {
             .advised{background:#f59e0b}
             .btn{padding:8px 16px;margin:5px;border:none;border-radius:4px;cursor:pointer;font-size:14px;text-decoration:none;display:inline-block;}
             .btn-primary{background:#3b82f6;color:white;}
+            .btn-secondary{background:#6b7280;color:white;}
         </style>
     </head>
     <body style="margin:24px;font-family:sans-serif;">
         <div style="margin-bottom:20px;">
             <a href="/dashboard">← Back to Dashboard</a>
-            <button class="btn btn-primary" onclick="refreshConversation()" style="float:right;">🔄 Refresh Analysis</button>
+            <div style="float:right;">
+                <button class="btn btn-primary" onclick="refreshConversation()">🔄 Refresh Transcript</button>
+                <button class="btn btn-secondary" onclick="regenerateAIAnalysis()">🤖 Regenerate AI Analysis</button>
+            </div>
         </div>
         
         <h2>Conversation Details</h2>
@@ -1038,8 +1129,28 @@ app.get('/conversations/:id', (req, res) => {
         <script>
             async function refreshConversation() {
                 try {
-                    document.getElementById('result').innerHTML = '<div style="color:#3b82f6;">⏳ Refreshing analysis...</div>';
+                    document.getElementById('result').innerHTML = '<div style="color:#3b82f6;">⏳ Refreshing transcript and analysis...</div>';
                     const response = await fetch(\`/api/conversations/${encodeURIComponent(c.id)}/refresh\`, { 
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' }
+                    });
+                    const result = await response.json();
+                    
+                    if (result.ok) {
+                        document.getElementById('result').innerHTML = \`<div style="color:green;padding:10px;background:#f0fdf4;border-radius:4px;">✅ \${result.message}</div>\`;
+                        setTimeout(() => location.reload(), 2000);
+                    } else {
+                        document.getElementById('result').innerHTML = \`<div style="color:red;padding:10px;background:#fef2f2;border-radius:4px;">❌ \${result.error}</div>\`;
+                    }
+                } catch (error) {
+                    document.getElementById('result').innerHTML = \`<div style="color:red;padding:10px;background:#fef2f2;border-radius:4px;">❌ Error: \${error.message}</div>\`;
+                }
+            }
+
+            async function regenerateAIAnalysis() {
+                try {
+                    document.getElementById('result').innerHTML = '<div style="color:#3b82f6;">🤖 Regenerating AI analysis... This may take a moment.</div>';
+                    const response = await fetch(\`/api/conversations/${encodeURIComponent(c.id)}/regenerate-analysis\`, { 
                         method: 'POST',
                         headers: { 'Content-Type': 'application/json' }
                     });
