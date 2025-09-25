@@ -314,12 +314,27 @@ app.post('/incoming', async (req, res) => {
         if (!callerNumber) throw new Error('No caller number found in request');
         
         const uvxResponse = await createUltravoxCall(ULTRAVOX_CALL_CONFIG);
+        console.log('Ultravox response structure:', JSON.stringify(uvxResponse, null, 2));
 
-        // ✅ FIX #1: Destructure the response correctly from the nested 'call' object.
-        const { joinUrl, callId } = uvxResponse.call;
+        // ✅ FIX: Handle different possible response structures
+        let joinUrl, callId;
+        
+        if (uvxResponse.call) {
+            // If response has nested 'call' object (webhook structure)
+            joinUrl = uvxResponse.call.joinUrl;
+            callId = uvxResponse.call.callId;
+        } else if (uvxResponse.joinUrl) {
+            // If response has direct properties (API response structure)
+            joinUrl = uvxResponse.joinUrl;
+            callId = uvxResponse.callId;
+        } else {
+            console.error('Unexpected response structure from Ultravox:', uvxResponse);
+            throw new Error('Invalid response structure from Ultravox API');
+        }
+
         if (!joinUrl || !callId) {
-            console.error('Invalid response structure from Ultravox:', uvxResponse);
-            throw new Error(`Invalid response structure from Ultravox`);
+            console.error('Missing joinUrl or callId in response:', { joinUrl, callId, uvxResponse });
+            throw new Error('Missing required fields (joinUrl, callId) in Ultravox response');
         }
 
         console.log(`Connecting call ${callSid} to Ultravox call ${callId}`);
@@ -327,8 +342,9 @@ app.post('/incoming', async (req, res) => {
         twiml.connect().stream({ url: joinUrl });
         res.type('text/xml').send(twiml.toString());
 
+        // Store the conversation record
         upsertConversation({
-            id: callId, // Use the correctly parsed callId
+            id: callId,
             twilioCallSid: callSid,
             from: callerNumber,
             createdAt: new Date().toISOString(),
