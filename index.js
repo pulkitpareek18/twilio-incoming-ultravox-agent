@@ -62,7 +62,6 @@ const ULTRAVOX_CALL_CONFIG = {
     medium: { twilio: {} },
     recordingEnabled: true,
     transcriptOptional: false,
-    eventWebhookUrl: ULTRAVOX_EVENT_WEBHOOK,
 };
 
 // MongoDB configuration
