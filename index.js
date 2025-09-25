@@ -24,7 +24,6 @@ const FIRST_SPEAKER = process.env.FIRST_SPEAKER || 'FIRST_SPEAKER_AGENT';
 
 // Webhook base URL to receive Ultravox events (set to your public URL)
 const BASE_URL = process.env.BASE_URL || 'https://twilio-incoming-ultravox-agent.onrender.com';
-const ULTRAVOX_EVENT_WEBHOOK = process.env.ULTRAVOX_EVENT_WEBHOOK || (BASE_URL ? `${BASE_URL}/ultravox/events` : '');
 
 // Ultravox configuration
 const SYSTEM_PROMPT = process.env.SYSTEM_PROMPT || `Your name is Arjun and you're a good friend who's always there to listen and chat. You have a calm and supportive personality, but you're casual and down-to-earth rather than clinical.
@@ -56,7 +55,7 @@ Avoid sounding like a professional therapist - you're just a good friend who hap
 const ULTRAVOX_CALL_CONFIG = {
     systemPrompt: SYSTEM_PROMPT,
     model: ULTRAVOX_MODEL,
-    voice: ULTRAVOX_VOICE_ID, // Indian male voice
+    voice: ULTRAVOX_VOICE_ID,
     temperature: ULTRAVOX_TEMPERATURE,
     firstSpeaker: FIRST_SPEAKER,
     medium: { twilio: {} },
@@ -290,6 +289,20 @@ async function getUltravoxTranscriptFromMessages(callId) {
     return '';
 }
 
+// Helper to find our conversation record using Twilio's CallSid
+async function findConversationByTwilioSid(twilioCallSid) {
+    try {
+        if (conversationsCol) {
+            return await conversationsCol.findOne({ twilioCallSid: twilioCallSid });
+        }
+        const list = await getConversations();
+        return list.find(x => x.twilioCallSid === twilioCallSid);
+    } catch (error) {
+        console.error('Failed to get conversation by Twilio SID:', error);
+        return null;
+    }
+}
+
 // --- Express Endpoints ---
 
 // Handle incoming calls
@@ -301,8 +314,13 @@ app.post('/incoming', async (req, res) => {
         if (!callerNumber) throw new Error('No caller number found in request');
         
         const uvxResponse = await createUltravoxCall(ULTRAVOX_CALL_CONFIG);
-        const { joinUrl, id: callId } = uvxResponse;
-        if (!joinUrl || !callId) throw new Error(`Invalid response from Ultravox`);
+
+        // ✅ FIX #1: Destructure the response correctly from the nested 'call' object.
+        const { joinUrl, callId } = uvxResponse.call;
+        if (!joinUrl || !callId) {
+            console.error('Invalid response structure from Ultravox:', uvxResponse);
+            throw new Error(`Invalid response structure from Ultravox`);
+        }
 
         console.log(`Connecting call ${callSid} to Ultravox call ${callId}`);
         const twiml = new twilio.twiml.VoiceResponse();
@@ -310,7 +328,7 @@ app.post('/incoming', async (req, res) => {
         res.type('text/xml').send(twiml.toString());
 
         upsertConversation({
-            id: callId,
+            id: callId, // Use the correctly parsed callId
             twilioCallSid: callSid,
             from: callerNumber,
             createdAt: new Date().toISOString(),
@@ -335,32 +353,41 @@ async function sendEmergencyAlert(alertData) {
 
 // Handle Ultravox event webhooks
 app.post('/ultravox/events', async (req, res) => {
-    console.log('Received Ultravox event:', JSON.stringify(req.body, null, 2));
+    console.log('Received Webhook Event:', JSON.stringify(req.body, null, 2));
     const event = req.body || {};
-    const callId = event.id || event.callId || event.data?.id;
-    const eventType = event.type || 'unknown';
+
+    // ✅ FIX #2: Parse callId correctly from nested 'call' object in webhook payload.
+    // Also, handle both Ultravox webhook format and Twilio Status Callback format.
+    const callId = event.call?.callId || req.body.ParentCallSid || req.body.CallSid;
+    const eventType = event.event || req.body.CallStatus; // 'call.ended' or 'completed'
 
     if (!callId) {
-        console.warn('Webhook event received without a callId.');
-        return res.status(200).json({ ok: true, message: 'Event acknowledged, no callId.' });
+        console.warn('Webhook event received without a CallSid or call.callId.');
+        return res.status(200).json({ ok: true, message: 'Event acknowledged, no Call ID found.' });
     }
     
     // Acknowledge the webhook immediately
     res.status(200).json({ ok: true, message: `Event '${eventType}' acknowledged.` });
 
-    if (eventType === 'call_ended') {
+    // For Twilio, the final status is 'completed'. For Ultravox, it's 'call.ended'.
+    if (eventType === 'completed' || eventType === 'call.ended') {
         console.log(`📞 Call ended for ${callId} - processing transcript and recording.`);
         try {
-            const existing = await getConversationById(callId);
+            // Important: We need the Ultravox Call ID, which we stored earlier.
+            // Twilio's CallSid is different. We need to look up our record by Twilio's SID.
+            const existing = await findConversationByTwilioSid(callId);
             if (!existing) {
-                console.error(`Could not find a record for callId: ${callId}`);
+                console.error(`Could not find a record for Twilio CallSid: ${callId}`);
                 return;
             }
 
+            const ultravoxCallId = existing.id;
+
             const [transcriptResult, callDetailsResult] = await Promise.allSettled([
-                getUltravoxTranscriptFromMessages(callId),
-                getUltravoxCall(callId),
+                getUltravoxTranscriptFromMessages(ultravoxCallId),
+                getUltravoxCall(ultravoxCallId),
             ]);
+            // Handle results
 
             const transcript = transcriptResult.status === 'fulfilled' ? transcriptResult.value : '';
             const callDetails = callDetailsResult.status === 'fulfilled' ? callDetailsResult.value : null;
